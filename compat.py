@@ -1,67 +1,51 @@
-"""
-requests.compat
-~~~~~~~~~~~~~~~
-
-This module previously handled import compatibility issues
-between Python 2 and Python 3. It remains for backwards
-compatibility until the next major version.
-"""
-
-from pip._vendor import chardet
-
+"""Python 2/3 compatibility"""
+import io
+import json
 import sys
 
-# -------
-# Pythons
-# -------
 
-# Syntax sugar.
-_ver = sys.version_info
+# Handle reading and writing JSON in UTF-8, on Python 3 and 2.
 
-#: Python 2.x?
-is_py2 = _ver[0] == 2
+if sys.version_info[0] >= 3:
+    # Python 3
+    def write_json(obj, path, **kwargs):
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(obj, f, **kwargs)
 
-#: Python 3.x?
-is_py3 = _ver[0] == 3
+    def read_json(path):
+        with open(path, 'r', encoding='utf-8') as f:
+            return json.load(f)
 
-# Note: We've patched out simplejson support in pip because it prevents
-#       upgrading simplejson on Windows.
-import json
-from json import JSONDecodeError
+else:
+    # Python 2
+    def write_json(obj, path, **kwargs):
+        with open(path, 'wb') as f:
+            json.dump(obj, f, encoding='utf-8', **kwargs)
 
-# Keep OrderedDict for backwards compatibility.
-from collections import OrderedDict
-from collections.abc import Callable, Mapping, MutableMapping
-from http import cookiejar as cookielib
-from http.cookies import Morsel
-from io import StringIO
+    def read_json(path):
+        with open(path, 'rb') as f:
+            return json.load(f)
 
-# --------------
-# Legacy Imports
-# --------------
-from urllib.parse import (
-    quote,
-    quote_plus,
-    unquote,
-    unquote_plus,
-    urldefrag,
-    urlencode,
-    urljoin,
-    urlparse,
-    urlsplit,
-    urlunparse,
-)
-from urllib.request import (
-    getproxies,
-    getproxies_environment,
-    parse_http_list,
-    proxy_bypass,
-    proxy_bypass_environment,
-)
 
-builtin_str = str
-str = str
-bytes = bytes
-basestring = (str, bytes)
-numeric_types = (int, float)
-integer_types = (int,)
+# FileNotFoundError
+
+try:
+    FileNotFoundError = FileNotFoundError
+except NameError:
+    FileNotFoundError = IOError
+
+
+if sys.version_info < (3, 6):
+    from toml import load as _toml_load  # noqa: F401
+
+    def toml_load(f):
+        w = io.TextIOWrapper(f, encoding="utf8", newline="")
+        try:
+            return _toml_load(w)
+        finally:
+            w.detach()
+
+    from toml import TomlDecodeError as TOMLDecodeError  # noqa: F401
+else:
+    from pip._vendor.tomli import load as toml_load  # noqa: F401
+    from pip._vendor.tomli import TOMLDecodeError  # noqa: F401

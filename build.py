@@ -1,152 +1,127 @@
-"""distutils.command.build
+"""Build a project using PEP 517 hooks.
+"""
+import argparse
+import io
+import logging
+import os
+import shutil
 
-Implements the Distutils 'build' command."""
+from .envbuild import BuildEnvironment
+from .wrappers import Pep517HookCaller
+from .dirtools import tempdir, mkdir_p
+from .compat import FileNotFoundError, toml_load
 
-import sys, os
-from distutils.core import Command
-from distutils.errors import DistutilsOptionError
-from distutils.util import get_platform
-
-
-def show_compilers():
-    from distutils.ccompiler import show_compilers
-
-    show_compilers()
+log = logging.getLogger(__name__)
 
 
-class build(Command):
+def validate_system(system):
+    """
+    Ensure build system has the requisite fields.
+    """
+    required = {'requires', 'build-backend'}
+    if not (required <= set(system)):
+        message = "Missing required fields: {missing}".format(
+            missing=required-set(system),
+        )
+        raise ValueError(message)
 
-    description = "build everything needed to install"
 
-    user_options = [
-        ('build-base=', 'b', "base directory for build library"),
-        ('build-purelib=', None, "build directory for platform-neutral distributions"),
-        ('build-platlib=', None, "build directory for platform-specific distributions"),
-        (
-            'build-lib=',
-            None,
-            "build directory for all distribution (defaults to either "
-            + "build-purelib or build-platlib",
-        ),
-        ('build-scripts=', None, "build directory for scripts"),
-        ('build-temp=', 't', "temporary build directory"),
-        (
-            'plat-name=',
-            'p',
-            "platform name to build for, if supported "
-            "(default: %s)" % get_platform(),
-        ),
-        ('compiler=', 'c', "specify the compiler type"),
-        ('parallel=', 'j', "number of parallel build jobs"),
-        ('debug', 'g', "compile extensions and libraries with debugging information"),
-        ('force', 'f', "forcibly build everything (ignore file timestamps)"),
-        ('executable=', 'e', "specify final destination interpreter path (build.py)"),
-    ]
+def load_system(source_dir):
+    """
+    Load the build system from a source dir (pyproject.toml).
+    """
+    pyproject = os.path.join(source_dir, 'pyproject.toml')
+    with io.open(pyproject, 'rb') as f:
+        pyproject_data = toml_load(f)
+    return pyproject_data['build-system']
 
-    boolean_options = ['debug', 'force']
 
-    help_options = [
-        ('help-compiler', None, "list available compilers", show_compilers),
-    ]
+def compat_system(source_dir):
+    """
+    Given a source dir, attempt to get a build system backend
+    and requirements from pyproject.toml. Fallback to
+    setuptools but only if the file was not found or a build
+    system was not indicated.
+    """
+    try:
+        system = load_system(source_dir)
+    except (FileNotFoundError, KeyError):
+        system = {}
+    system.setdefault(
+        'build-backend',
+        'setuptools.build_meta:__legacy__',
+    )
+    system.setdefault('requires', ['setuptools', 'wheel'])
+    return system
 
-    def initialize_options(self):
-        self.build_base = 'build'
-        # these are decided only after 'build_base' has its final value
-        # (unless overridden by the user or client)
-        self.build_purelib = None
-        self.build_platlib = None
-        self.build_lib = None
-        self.build_temp = None
-        self.build_scripts = None
-        self.compiler = None
-        self.plat_name = None
-        self.debug = None
-        self.force = 0
-        self.executable = None
-        self.parallel = None
 
-    def finalize_options(self):
-        if self.plat_name is None:
-            self.plat_name = get_platform()
-        else:
-            # plat-name only supported for windows (other platforms are
-            # supported via ./configure flags, if at all).  Avoid misleading
-            # other platforms.
-            if os.name != 'nt':
-                raise DistutilsOptionError(
-                    "--plat-name only supported on Windows (try "
-                    "using './configure --help' on your platform)"
-                )
+def _do_build(hooks, env, dist, dest):
+    get_requires_name = 'get_requires_for_build_{dist}'.format(**locals())
+    get_requires = getattr(hooks, get_requires_name)
+    reqs = get_requires({})
+    log.info('Got build requires: %s', reqs)
 
-        plat_specifier = ".%s-%s" % (self.plat_name, sys.implementation.cache_tag)
+    env.pip_install(reqs)
+    log.info('Installed dynamic build dependencies')
 
-        # Make it so Python 2.x and Python 2.x with --with-pydebug don't
-        # share the same build directories. Doing so confuses the build
-        # process for C modules
-        if hasattr(sys, 'gettotalrefcount'):
-            plat_specifier += '-pydebug'
+    with tempdir() as td:
+        log.info('Trying to build %s in %s', dist, td)
+        build_name = 'build_{dist}'.format(**locals())
+        build = getattr(hooks, build_name)
+        filename = build(td, {})
+        source = os.path.join(td, filename)
+        shutil.move(source, os.path.join(dest, os.path.basename(filename)))
 
-        # 'build_purelib' and 'build_platlib' just default to 'lib' and
-        # 'lib.<plat>' under the base build directory.  We only use one of
-        # them for a given distribution, though --
-        if self.build_purelib is None:
-            self.build_purelib = os.path.join(self.build_base, 'lib')
-        if self.build_platlib is None:
-            self.build_platlib = os.path.join(self.build_base, 'lib' + plat_specifier)
 
-        # 'build_lib' is the actual directory that we will use for this
-        # particular module distribution -- if user didn't supply it, pick
-        # one of 'build_purelib' or 'build_platlib'.
-        if self.build_lib is None:
-            if self.distribution.has_ext_modules():
-                self.build_lib = self.build_platlib
-            else:
-                self.build_lib = self.build_purelib
+def build(source_dir, dist, dest=None, system=None):
+    system = system or load_system(source_dir)
+    dest = os.path.join(source_dir, dest or 'dist')
+    mkdir_p(dest)
 
-        # 'build_temp' -- temporary directory for compiler turds,
-        # "build/temp.<plat>"
-        if self.build_temp is None:
-            self.build_temp = os.path.join(self.build_base, 'temp' + plat_specifier)
-        if self.build_scripts is None:
-            self.build_scripts = os.path.join(
-                self.build_base, 'scripts-%d.%d' % sys.version_info[:2]
-            )
+    validate_system(system)
+    hooks = Pep517HookCaller(
+        source_dir, system['build-backend'], system.get('backend-path')
+    )
 
-        if self.executable is None and sys.executable:
-            self.executable = os.path.normpath(sys.executable)
+    with BuildEnvironment() as env:
+        env.pip_install(system['requires'])
+        _do_build(hooks, env, dist, dest)
 
-        if isinstance(self.parallel, str):
-            try:
-                self.parallel = int(self.parallel)
-            except ValueError:
-                raise DistutilsOptionError("parallel should be an integer")
 
-    def run(self):
-        # Run all relevant sub-commands.  This will be some subset of:
-        #  - build_py      - pure Python modules
-        #  - build_clib    - standalone C libraries
-        #  - build_ext     - Python extensions
-        #  - build_scripts - (Python) scripts
-        for cmd_name in self.get_sub_commands():
-            self.run_command(cmd_name)
+parser = argparse.ArgumentParser()
+parser.add_argument(
+    'source_dir',
+    help="A directory containing pyproject.toml",
+)
+parser.add_argument(
+    '--binary', '-b',
+    action='store_true',
+    default=False,
+)
+parser.add_argument(
+    '--source', '-s',
+    action='store_true',
+    default=False,
+)
+parser.add_argument(
+    '--out-dir', '-o',
+    help="Destination in which to save the builds relative to source dir",
+)
 
-    # -- Predicates for the sub-command list ---------------------------
 
-    def has_pure_modules(self):
-        return self.distribution.has_pure_modules()
+def main(args):
+    log.warning('pep517.build is deprecated. '
+                'Consider switching to https://pypi.org/project/build/')
 
-    def has_c_libraries(self):
-        return self.distribution.has_c_libraries()
+    # determine which dists to build
+    dists = list(filter(None, (
+        'sdist' if args.source or not args.binary else None,
+        'wheel' if args.binary or not args.source else None,
+    )))
 
-    def has_ext_modules(self):
-        return self.distribution.has_ext_modules()
+    for dist in dists:
+        build(args.source_dir, dist, args.out_dir)
 
-    def has_scripts(self):
-        return self.distribution.has_scripts()
 
-    sub_commands = [
-        ('build_py', has_pure_modules),
-        ('build_clib', has_c_libraries),
-        ('build_ext', has_ext_modules),
-        ('build_scripts', has_scripts),
-    ]
+if __name__ == '__main__':
+    main(parser.parse_args())

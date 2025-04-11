@@ -1,153 +1,207 @@
-"""distutils.command.check
-
-Implements the Distutils 'check' command.
+"""Check a project and backend by attempting to build using PEP 517 hooks.
 """
-from email.utils import getaddresses
+import argparse
+import io
+import logging
+import os
+from os.path import isfile, join as pjoin
+import shutil
+from subprocess import CalledProcessError
+import sys
+import tarfile
+from tempfile import mkdtemp
+import zipfile
 
-from distutils.core import Command
-from distutils.errors import DistutilsSetupError
+from .colorlog import enable_colourful_output
+from .compat import TOMLDecodeError, toml_load
+from .envbuild import BuildEnvironment
+from .wrappers import Pep517HookCaller
 
-try:
-    # docutils is installed
-    from docutils.utils import Reporter
-    from docutils.parsers.rst import Parser
-    from docutils import frontend
-    from docutils import nodes
-
-    class SilentReporter(Reporter):
-        def __init__(
-            self,
-            source,
-            report_level,
-            halt_level,
-            stream=None,
-            debug=0,
-            encoding='ascii',
-            error_handler='replace',
-        ):
-            self.messages = []
-            super().__init__(
-                source, report_level, halt_level, stream, debug, encoding, error_handler
-            )
-
-        def system_message(self, level, message, *children, **kwargs):
-            self.messages.append((level, message, children, kwargs))
-            return nodes.system_message(
-                message, level=level, type=self.levels[level], *children, **kwargs
-            )
-
-    HAS_DOCUTILS = True
-except Exception:
-    # Catch all exceptions because exceptions besides ImportError probably
-    # indicate that docutils is not ported to Py3k.
-    HAS_DOCUTILS = False
+log = logging.getLogger(__name__)
 
 
-class check(Command):
-    """This command checks the meta-data of the package."""
-
-    description = "perform some checks on the package"
-    user_options = [
-        ('metadata', 'm', 'Verify meta-data'),
-        (
-            'restructuredtext',
-            'r',
-            (
-                'Checks if long string meta-data syntax '
-                'are reStructuredText-compliant'
-            ),
-        ),
-        ('strict', 's', 'Will exit with an error if a check fails'),
-    ]
-
-    boolean_options = ['metadata', 'restructuredtext', 'strict']
-
-    def initialize_options(self):
-        """Sets default values for options."""
-        self.restructuredtext = 0
-        self.metadata = 1
-        self.strict = 0
-        self._warnings = 0
-
-    def finalize_options(self):
-        pass
-
-    def warn(self, msg):
-        """Counts the number of warnings that occurs."""
-        self._warnings += 1
-        return Command.warn(self, msg)
-
-    def run(self):
-        """Runs the command."""
-        # perform the various tests
-        if self.metadata:
-            self.check_metadata()
-        if self.restructuredtext:
-            if HAS_DOCUTILS:
-                self.check_restructuredtext()
-            elif self.strict:
-                raise DistutilsSetupError('The docutils package is needed.')
-
-        # let's raise an error in strict mode, if we have at least
-        # one warning
-        if self.strict and self._warnings > 0:
-            raise DistutilsSetupError('Please correct your package.')
-
-    def check_metadata(self):
-        """Ensures that all required elements of meta-data are supplied.
-
-        Required fields:
-            name, version
-
-        Warns if any are missing.
-        """
-        metadata = self.distribution.metadata
-
-        missing = []
-        for attr in 'name', 'version':
-            if not getattr(metadata, attr, None):
-                missing.append(attr)
-
-        if missing:
-            self.warn("missing required meta-data: %s" % ', '.join(missing))
-
-    def check_restructuredtext(self):
-        """Checks if the long string fields are reST-compliant."""
-        data = self.distribution.get_long_description()
-        for warning in self._check_rst_data(data):
-            line = warning[-1].get('line')
-            if line is None:
-                warning = warning[1]
-            else:
-                warning = '%s (line %s)' % (warning[1], line)
-            self.warn(warning)
-
-    def _check_rst_data(self, data):
-        """Returns warnings when the provided data doesn't compile."""
-        # the include and csv_table directives need this to be a path
-        source_path = self.distribution.script_name or 'setup.py'
-        parser = Parser()
-        settings = frontend.OptionParser(components=(Parser,)).get_default_values()
-        settings.tab_width = 4
-        settings.pep_references = None
-        settings.rfc_references = None
-        reporter = SilentReporter(
-            source_path,
-            settings.report_level,
-            settings.halt_level,
-            stream=settings.warning_stream,
-            debug=settings.debug,
-            encoding=settings.error_encoding,
-            error_handler=settings.error_encoding_error_handler,
-        )
-
-        document = nodes.document(settings, reporter, source=source_path)
-        document.note_source(source_path, -1)
+def check_build_sdist(hooks, build_sys_requires):
+    with BuildEnvironment() as env:
         try:
-            parser.parse(data, document)
-        except AttributeError as e:
-            reporter.messages.append(
-                (-1, 'Could not finish the parsing: %s.' % e, '', {})
-            )
+            env.pip_install(build_sys_requires)
+            log.info('Installed static build dependencies')
+        except CalledProcessError:
+            log.error('Failed to install static build dependencies')
+            return False
 
-        return reporter.messages
+        try:
+            reqs = hooks.get_requires_for_build_sdist({})
+            log.info('Got build requires: %s', reqs)
+        except Exception:
+            log.error('Failure in get_requires_for_build_sdist', exc_info=True)
+            return False
+
+        try:
+            env.pip_install(reqs)
+            log.info('Installed dynamic build dependencies')
+        except CalledProcessError:
+            log.error('Failed to install dynamic build dependencies')
+            return False
+
+        td = mkdtemp()
+        log.info('Trying to build sdist in %s', td)
+        try:
+            try:
+                filename = hooks.build_sdist(td, {})
+                log.info('build_sdist returned %r', filename)
+            except Exception:
+                log.info('Failure in build_sdist', exc_info=True)
+                return False
+
+            if not filename.endswith('.tar.gz'):
+                log.error(
+                    "Filename %s doesn't have .tar.gz extension", filename)
+                return False
+
+            path = pjoin(td, filename)
+            if isfile(path):
+                log.info("Output file %s exists", path)
+            else:
+                log.error("Output file %s does not exist", path)
+                return False
+
+            if tarfile.is_tarfile(path):
+                log.info("Output file is a tar file")
+            else:
+                log.error("Output file is not a tar file")
+                return False
+
+        finally:
+            shutil.rmtree(td)
+
+        return True
+
+
+def check_build_wheel(hooks, build_sys_requires):
+    with BuildEnvironment() as env:
+        try:
+            env.pip_install(build_sys_requires)
+            log.info('Installed static build dependencies')
+        except CalledProcessError:
+            log.error('Failed to install static build dependencies')
+            return False
+
+        try:
+            reqs = hooks.get_requires_for_build_wheel({})
+            log.info('Got build requires: %s', reqs)
+        except Exception:
+            log.error('Failure in get_requires_for_build_sdist', exc_info=True)
+            return False
+
+        try:
+            env.pip_install(reqs)
+            log.info('Installed dynamic build dependencies')
+        except CalledProcessError:
+            log.error('Failed to install dynamic build dependencies')
+            return False
+
+        td = mkdtemp()
+        log.info('Trying to build wheel in %s', td)
+        try:
+            try:
+                filename = hooks.build_wheel(td, {})
+                log.info('build_wheel returned %r', filename)
+            except Exception:
+                log.info('Failure in build_wheel', exc_info=True)
+                return False
+
+            if not filename.endswith('.whl'):
+                log.error("Filename %s doesn't have .whl extension", filename)
+                return False
+
+            path = pjoin(td, filename)
+            if isfile(path):
+                log.info("Output file %s exists", path)
+            else:
+                log.error("Output file %s does not exist", path)
+                return False
+
+            if zipfile.is_zipfile(path):
+                log.info("Output file is a zip file")
+            else:
+                log.error("Output file is not a zip file")
+                return False
+
+        finally:
+            shutil.rmtree(td)
+
+        return True
+
+
+def check(source_dir):
+    pyproject = pjoin(source_dir, 'pyproject.toml')
+    if isfile(pyproject):
+        log.info('Found pyproject.toml')
+    else:
+        log.error('Missing pyproject.toml')
+        return False
+
+    try:
+        with io.open(pyproject, 'rb') as f:
+            pyproject_data = toml_load(f)
+        # Ensure the mandatory data can be loaded
+        buildsys = pyproject_data['build-system']
+        requires = buildsys['requires']
+        backend = buildsys['build-backend']
+        backend_path = buildsys.get('backend-path')
+        log.info('Loaded pyproject.toml')
+    except (TOMLDecodeError, KeyError):
+        log.error("Invalid pyproject.toml", exc_info=True)
+        return False
+
+    hooks = Pep517HookCaller(source_dir, backend, backend_path)
+
+    sdist_ok = check_build_sdist(hooks, requires)
+    wheel_ok = check_build_wheel(hooks, requires)
+
+    if not sdist_ok:
+        log.warning('Sdist checks failed; scroll up to see')
+    if not wheel_ok:
+        log.warning('Wheel checks failed')
+
+    return sdist_ok
+
+
+def main(argv=None):
+    log.warning('pep517.check is deprecated. '
+                'Consider switching to https://pypi.org/project/build/')
+
+    ap = argparse.ArgumentParser()
+    ap.add_argument(
+        'source_dir',
+        help="A directory containing pyproject.toml")
+    args = ap.parse_args(argv)
+
+    enable_colourful_output()
+
+    ok = check(args.source_dir)
+
+    if ok:
+        print(ansi('Checks passed', 'green'))
+    else:
+        print(ansi('Checks failed', 'red'))
+        sys.exit(1)
+
+
+ansi_codes = {
+    'reset': '\x1b[0m',
+    'bold': '\x1b[1m',
+    'red': '\x1b[31m',
+    'green': '\x1b[32m',
+}
+
+
+def ansi(s, attr):
+    if os.name != 'nt' and sys.stdout.isatty():
+        return ansi_codes[attr] + str(s) + ansi_codes['reset']
+    else:
+        return str(s)
+
+
+if __name__ == '__main__':
+    main()
