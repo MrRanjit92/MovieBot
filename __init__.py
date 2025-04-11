@@ -1,34 +1,11 @@
-from functools import reduce
-from typing import Any, Callable, Dict
+# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2021 Taneli Hukkinen
+# Licensed to PSF under a Contributor Agreement.
 
-from . import formats
-from .error_reporting import detailed_errors, ValidationError
-from .extra_validations import EXTRA_VALIDATIONS
-from .fastjsonschema_exceptions import JsonSchemaException, JsonSchemaValueException
-from .fastjsonschema_validations import validate as _validate
+__all__ = ("loads", "load", "TOMLDecodeError")
+__version__ = "2.0.1"  # DO NOT EDIT THIS LINE MANUALLY. LET bump2version UTILITY DO IT
 
-__all__ = [
-    "validate",
-    "FORMAT_FUNCTIONS",
-    "EXTRA_VALIDATIONS",
-    "ValidationError",
-    "JsonSchemaException",
-    "JsonSchemaValueException",
-]
+from ._parser import TOMLDecodeError, load, loads
 
-
-FORMAT_FUNCTIONS: Dict[str, Callable[[str], bool]] = {
-    fn.__name__.replace("_", "-"): fn
-    for fn in formats.__dict__.values()
-    if callable(fn) and not fn.__name__.startswith("_")
-}
-
-
-def validate(data: Any) -> bool:
-    """Validate the given ``data`` object using JSON Schema
-    This function raises ``ValidationError`` if ``data`` is invalid.
-    """
-    with detailed_errors():
-        _validate(data, custom_formats=FORMAT_FUNCTIONS)
-    reduce(lambda acc, fn: fn(acc), EXTRA_VALIDATIONS, data)
-    return True
+# Pretend this exception was created here.
+TOMLDecodeError.__module__ = __name__
