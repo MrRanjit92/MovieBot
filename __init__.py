@@ -1,17 +1,44 @@
-"""This is a subpackage because the directory is on sys.path for _in_process.py
+from .package_data import __version__
+from .core import (
+    IDNABidiError,
+    IDNAError,
+    InvalidCodepoint,
+    InvalidCodepointContext,
+    alabel,
+    check_bidi,
+    check_hyphen_ok,
+    check_initial_combiner,
+    check_label,
+    check_nfc,
+    decode,
+    encode,
+    ulabel,
+    uts46_remap,
+    valid_contextj,
+    valid_contexto,
+    valid_label_length,
+    valid_string_length,
+)
+from .intranges import intranges_contain
 
-The subpackage should stay as empty as possible to avoid shadowing modules that
-the backend might import.
-"""
-from os.path import dirname, abspath, join as pjoin
-from contextlib import contextmanager
-
-try:
-    import importlib.resources as resources
-
-    def _in_proc_script_path():
-        return resources.path(__package__, '_in_process.py')
-except ImportError:
-    @contextmanager
-    def _in_proc_script_path():
-        yield pjoin(dirname(abspath(__file__)), '_in_process.py')
+__all__ = [
+    "IDNABidiError",
+    "IDNAError",
+    "InvalidCodepoint",
+    "InvalidCodepointContext",
+    "alabel",
+    "check_bidi",
+    "check_hyphen_ok",
+    "check_initial_combiner",
+    "check_label",
+    "check_nfc",
+    "decode",
+    "encode",
+    "intranges_contain",
+    "ulabel",
+    "uts46_remap",
+    "valid_contextj",
+    "valid_contexto",
+    "valid_label_length",
+    "valid_string_length",
+]
