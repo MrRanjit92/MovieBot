@@ -1,811 +1,827 @@
-"""distutils.command.install
-
-Implements the Distutils 'install' command."""
-
-import sys
+import errno
+import json
+import operator
 import os
-import contextlib
-import sysconfig
-import itertools
+import shutil
+import site
+from optparse import SUPPRESS_HELP, Values
+from typing import Iterable, List, Optional
 
-from distutils import log
-from distutils.core import Command
-from distutils.debug import DEBUG
-from distutils.sysconfig import get_config_vars
-from distutils.errors import DistutilsPlatformError
-from distutils.file_util import write_file
-from distutils.util import convert_path, subst_vars, change_root
-from distutils.util import get_platform
-from distutils.errors import DistutilsOptionError
-from . import _framework_compat as fw
-from .. import _collections
+from pip._vendor.packaging.utils import canonicalize_name
+from pip._vendor.rich import print_json
 
-from site import USER_BASE
-from site import USER_SITE
+from pip._internal.cache import WheelCache
+from pip._internal.cli import cmdoptions
+from pip._internal.cli.cmdoptions import make_target_python
+from pip._internal.cli.req_command import (
+    RequirementCommand,
+    warn_if_run_as_root,
+    with_cleanup,
+)
+from pip._internal.cli.status_codes import ERROR, SUCCESS
+from pip._internal.exceptions import CommandError, InstallationError
+from pip._internal.locations import get_scheme
+from pip._internal.metadata import get_environment
+from pip._internal.models.format_control import FormatControl
+from pip._internal.models.installation_report import InstallationReport
+from pip._internal.operations.build.build_tracker import get_build_tracker
+from pip._internal.operations.check import ConflictDetails, check_install_conflicts
+from pip._internal.req import install_given_reqs
+from pip._internal.req.req_install import InstallRequirement
+from pip._internal.utils.compat import WINDOWS
+from pip._internal.utils.distutils_args import parse_distutils_args
+from pip._internal.utils.filesystem import test_writable_dir
+from pip._internal.utils.logging import getLogger
+from pip._internal.utils.misc import (
+    ensure_dir,
+    get_pip_version,
+    protect_pip_from_modification_on_windows,
+    write_output,
+)
+from pip._internal.utils.temp_dir import TempDirectory
+from pip._internal.utils.virtualenv import (
+    running_under_virtualenv,
+    virtualenv_no_global,
+)
+from pip._internal.wheel_builder import (
+    BinaryAllowedPredicate,
+    build,
+    should_build_for_install_command,
+)
 
-HAS_USER_SITE = True
-
-WINDOWS_SCHEME = {
-    'purelib': '{base}/Lib/site-packages',
-    'platlib': '{base}/Lib/site-packages',
-    'headers': '{base}/Include/{dist_name}',
-    'scripts': '{base}/Scripts',
-    'data': '{base}',
-}
-
-INSTALL_SCHEMES = {
-    'posix_prefix': {
-        'purelib': '{base}/lib/{implementation_lower}{py_version_short}/site-packages',
-        'platlib': '{platbase}/{platlibdir}/{implementation_lower}{py_version_short}/site-packages',
-        'headers': '{base}/include/{implementation_lower}{py_version_short}{abiflags}/{dist_name}',
-        'scripts': '{base}/bin',
-        'data': '{base}',
-    },
-    'posix_home': {
-        'purelib': '{base}/lib/{implementation_lower}',
-        'platlib': '{base}/{platlibdir}/{implementation_lower}',
-        'headers': '{base}/include/{implementation_lower}/{dist_name}',
-        'scripts': '{base}/bin',
-        'data': '{base}',
-    },
-    'nt': WINDOWS_SCHEME,
-    'pypy': {
-        'purelib': '{base}/site-packages',
-        'platlib': '{base}/site-packages',
-        'headers': '{base}/include/{dist_name}',
-        'scripts': '{base}/bin',
-        'data': '{base}',
-    },
-    'pypy_nt': {
-        'purelib': '{base}/site-packages',
-        'platlib': '{base}/site-packages',
-        'headers': '{base}/include/{dist_name}',
-        'scripts': '{base}/Scripts',
-        'data': '{base}',
-    },
-}
-
-# user site schemes
-if HAS_USER_SITE:
-    INSTALL_SCHEMES['nt_user'] = {
-        'purelib': '{usersite}',
-        'platlib': '{usersite}',
-        'headers': '{userbase}/{implementation}{py_version_nodot_plat}/Include/{dist_name}',
-        'scripts': '{userbase}/{implementation}{py_version_nodot_plat}/Scripts',
-        'data': '{userbase}',
-    }
-
-    INSTALL_SCHEMES['posix_user'] = {
-        'purelib': '{usersite}',
-        'platlib': '{usersite}',
-        'headers': '{userbase}/include/{implementation_lower}{py_version_short}{abiflags}/{dist_name}',
-        'scripts': '{userbase}/bin',
-        'data': '{userbase}',
-    }
+logger = getLogger(__name__)
 
 
-INSTALL_SCHEMES.update(fw.schemes)
+def get_check_binary_allowed(format_control: FormatControl) -> BinaryAllowedPredicate:
+    def check_binary_allowed(req: InstallRequirement) -> bool:
+        canonical_name = canonicalize_name(req.name or "")
+        allowed_formats = format_control.get_allowed_formats(canonical_name)
+        return "binary" in allowed_formats
+
+    return check_binary_allowed
 
 
-# The keys to an installation scheme; if any new types of files are to be
-# installed, be sure to add an entry to every installation scheme above,
-# and to SCHEME_KEYS here.
-SCHEME_KEYS = ('purelib', 'platlib', 'headers', 'scripts', 'data')
-
-
-def _load_sysconfig_schemes():
-    with contextlib.suppress(AttributeError):
-        return {
-            scheme: sysconfig.get_paths(scheme, expand=False)
-            for scheme in sysconfig.get_scheme_names()
-        }
-
-
-def _load_schemes():
+class InstallCommand(RequirementCommand):
     """
-    Extend default schemes with schemes from sysconfig.
+    Install packages from:
+
+    - PyPI (and other indexes) using requirement specifiers.
+    - VCS project urls.
+    - Local project directories.
+    - Local or remote source archives.
+
+    pip also supports installing from "requirements files", which provide
+    an easy way to specify a whole environment to be installed.
     """
 
-    sysconfig_schemes = _load_sysconfig_schemes() or {}
+    usage = """
+      %prog [options] <requirement specifier> [package-index-options] ...
+      %prog [options] -r <requirements file> [package-index-options] ...
+      %prog [options] [-e] <vcs project url> ...
+      %prog [options] [-e] <local project path> ...
+      %prog [options] <archive url/path> ..."""
 
-    return {
-        scheme: {
-            **INSTALL_SCHEMES.get(scheme, {}),
-            **sysconfig_schemes.get(scheme, {}),
-        }
-        for scheme in set(itertools.chain(INSTALL_SCHEMES, sysconfig_schemes))
-    }
+    def add_options(self) -> None:
+        self.cmd_opts.add_option(cmdoptions.requirements())
+        self.cmd_opts.add_option(cmdoptions.constraints())
+        self.cmd_opts.add_option(cmdoptions.no_deps())
+        self.cmd_opts.add_option(cmdoptions.pre())
 
-
-def _get_implementation():
-    if hasattr(sys, 'pypy_version_info'):
-        return 'PyPy'
-    else:
-        return 'Python'
-
-
-def _select_scheme(ob, name):
-    scheme = _inject_headers(name, _load_scheme(_resolve_scheme(name)))
-    vars(ob).update(_remove_set(ob, _scheme_attrs(scheme)))
-
-
-def _remove_set(ob, attrs):
-    """
-    Include only attrs that are None in ob.
-    """
-    return {key: value for key, value in attrs.items() if getattr(ob, key) is None}
-
-
-def _resolve_scheme(name):
-    os_name, sep, key = name.partition('_')
-    try:
-        resolved = sysconfig.get_preferred_scheme(key)
-    except Exception:
-        resolved = fw.scheme(_pypy_hack(name))
-    return resolved
-
-
-def _load_scheme(name):
-    return _load_schemes()[name]
-
-
-def _inject_headers(name, scheme):
-    """
-    Given a scheme name and the resolved scheme,
-    if the scheme does not include headers, resolve
-    the fallback scheme for the name and use headers
-    from it. pypa/distutils#88
-    """
-    # Bypass the preferred scheme, which may not
-    # have defined headers.
-    fallback = _load_scheme(_pypy_hack(name))
-    scheme.setdefault('headers', fallback['headers'])
-    return scheme
-
-
-def _scheme_attrs(scheme):
-    """Resolve install directories by applying the install schemes."""
-    return {f'install_{key}': scheme[key] for key in SCHEME_KEYS}
-
-
-def _pypy_hack(name):
-    PY37 = sys.version_info < (3, 8)
-    old_pypy = hasattr(sys, 'pypy_version_info') and PY37
-    prefix = not name.endswith(('_user', '_home'))
-    pypy_name = 'pypy' + '_nt' * (os.name == 'nt')
-    return pypy_name if old_pypy and prefix else name
-
-
-class install(Command):
-
-    description = "install everything from build directory"
-
-    user_options = [
-        # Select installation scheme and set base director(y|ies)
-        ('prefix=', None, "installation prefix"),
-        ('exec-prefix=', None, "(Unix only) prefix for platform-specific files"),
-        ('home=', None, "(Unix only) home directory to install under"),
-        # Or, just set the base director(y|ies)
-        (
-            'install-base=',
-            None,
-            "base installation directory (instead of --prefix or --home)",
-        ),
-        (
-            'install-platbase=',
-            None,
-            "base installation directory for platform-specific files "
-            + "(instead of --exec-prefix or --home)",
-        ),
-        ('root=', None, "install everything relative to this alternate root directory"),
-        # Or, explicitly set the installation scheme
-        (
-            'install-purelib=',
-            None,
-            "installation directory for pure Python module distributions",
-        ),
-        (
-            'install-platlib=',
-            None,
-            "installation directory for non-pure module distributions",
-        ),
-        (
-            'install-lib=',
-            None,
-            "installation directory for all module distributions "
-            + "(overrides --install-purelib and --install-platlib)",
-        ),
-        ('install-headers=', None, "installation directory for C/C++ headers"),
-        ('install-scripts=', None, "installation directory for Python scripts"),
-        ('install-data=', None, "installation directory for data files"),
-        # Byte-compilation options -- see install_lib.py for details, as
-        # these are duplicated from there (but only install_lib does
-        # anything with them).
-        ('compile', 'c', "compile .py to .pyc [default]"),
-        ('no-compile', None, "don't compile .py files"),
-        (
-            'optimize=',
-            'O',
-            "also compile with optimization: -O1 for \"python -O\", "
-            "-O2 for \"python -OO\", and -O0 to disable [default: -O0]",
-        ),
-        # Miscellaneous control options
-        ('force', 'f', "force installation (overwrite any existing files)"),
-        ('skip-build', None, "skip rebuilding everything (for testing/debugging)"),
-        # Where to install documentation (eventually!)
-        # ('doc-format=', None, "format of documentation to generate"),
-        # ('install-man=', None, "directory for Unix man pages"),
-        # ('install-html=', None, "directory for HTML documentation"),
-        # ('install-info=', None, "directory for GNU info files"),
-        ('record=', None, "filename in which to record list of installed files"),
-    ]
-
-    boolean_options = ['compile', 'force', 'skip-build']
-
-    if HAS_USER_SITE:
-        user_options.append(
-            ('user', None, "install in user site-package '%s'" % USER_SITE)
+        self.cmd_opts.add_option(cmdoptions.editable())
+        self.cmd_opts.add_option(
+            "--dry-run",
+            action="store_true",
+            dest="dry_run",
+            default=False,
+            help=(
+                "Don't actually install anything, just print what would be. "
+                "Can be used in combination with --ignore-installed "
+                "to 'resolve' the requirements."
+            ),
         )
-        boolean_options.append('user')
+        self.cmd_opts.add_option(
+            "-t",
+            "--target",
+            dest="target_dir",
+            metavar="dir",
+            default=None,
+            help=(
+                "Install packages into <dir>. "
+                "By default this will not replace existing files/folders in "
+                "<dir>. Use --upgrade to replace existing packages in <dir> "
+                "with new versions."
+            ),
+        )
+        cmdoptions.add_target_python_options(self.cmd_opts)
 
-    negative_opt = {'no-compile': 'compile'}
+        self.cmd_opts.add_option(
+            "--user",
+            dest="use_user_site",
+            action="store_true",
+            help=(
+                "Install to the Python user install directory for your "
+                "platform. Typically ~/.local/, or %APPDATA%\\Python on "
+                "Windows. (See the Python documentation for site.USER_BASE "
+                "for full details.)"
+            ),
+        )
+        self.cmd_opts.add_option(
+            "--no-user",
+            dest="use_user_site",
+            action="store_false",
+            help=SUPPRESS_HELP,
+        )
+        self.cmd_opts.add_option(
+            "--root",
+            dest="root_path",
+            metavar="dir",
+            default=None,
+            help="Install everything relative to this alternate root directory.",
+        )
+        self.cmd_opts.add_option(
+            "--prefix",
+            dest="prefix_path",
+            metavar="dir",
+            default=None,
+            help=(
+                "Installation prefix where lib, bin and other top-level "
+                "folders are placed"
+            ),
+        )
 
-    def initialize_options(self):
-        """Initializes options."""
-        # High-level options: these select both an installation base
-        # and scheme.
-        self.prefix = None
-        self.exec_prefix = None
-        self.home = None
-        self.user = 0
+        self.cmd_opts.add_option(cmdoptions.src())
 
-        # These select only the installation base; it's up to the user to
-        # specify the installation scheme (currently, that means supplying
-        # the --install-{platlib,purelib,scripts,data} options).
-        self.install_base = None
-        self.install_platbase = None
-        self.root = None
+        self.cmd_opts.add_option(
+            "-U",
+            "--upgrade",
+            dest="upgrade",
+            action="store_true",
+            help=(
+                "Upgrade all specified packages to the newest available "
+                "version. The handling of dependencies depends on the "
+                "upgrade-strategy used."
+            ),
+        )
 
-        # These options are the actual installation directories; if not
-        # supplied by the user, they are filled in using the installation
-        # scheme implied by prefix/exec-prefix/home and the contents of
-        # that installation scheme.
-        self.install_purelib = None  # for pure module distributions
-        self.install_platlib = None  # non-pure (dists w/ extensions)
-        self.install_headers = None  # for C/C++ headers
-        self.install_lib = None  # set to either purelib or platlib
-        self.install_scripts = None
-        self.install_data = None
-        self.install_userbase = USER_BASE
-        self.install_usersite = USER_SITE
+        self.cmd_opts.add_option(
+            "--upgrade-strategy",
+            dest="upgrade_strategy",
+            default="only-if-needed",
+            choices=["only-if-needed", "eager"],
+            help=(
+                "Determines how dependency upgrading should be handled "
+                "[default: %default]. "
+                '"eager" - dependencies are upgraded regardless of '
+                "whether the currently installed version satisfies the "
+                "requirements of the upgraded package(s). "
+                '"only-if-needed" -  are upgraded only when they do not '
+                "satisfy the requirements of the upgraded package(s)."
+            ),
+        )
 
-        self.compile = None
-        self.optimize = None
+        self.cmd_opts.add_option(
+            "--force-reinstall",
+            dest="force_reinstall",
+            action="store_true",
+            help="Reinstall all packages even if they are already up-to-date.",
+        )
 
-        # Deprecated
-        # These two are for putting non-packagized distributions into their
-        # own directory and creating a .pth file if it makes sense.
-        # 'extra_path' comes from the setup file; 'install_path_file' can
-        # be turned off if it makes no sense to install a .pth file.  (But
-        # better to install it uselessly than to guess wrong and not
-        # install it when it's necessary and would be used!)  Currently,
-        # 'install_path_file' is always true unless some outsider meddles
-        # with it.
-        self.extra_path = None
-        self.install_path_file = 1
+        self.cmd_opts.add_option(
+            "-I",
+            "--ignore-installed",
+            dest="ignore_installed",
+            action="store_true",
+            help=(
+                "Ignore the installed packages, overwriting them. "
+                "This can break your system if the existing package "
+                "is of a different version or was installed "
+                "with a different package manager!"
+            ),
+        )
 
-        # 'force' forces installation, even if target files are not
-        # out-of-date.  'skip_build' skips running the "build" command,
-        # handy if you know it's not necessary.  'warn_dir' (which is *not*
-        # a user option, it's just there so the bdist_* commands can turn
-        # it off) determines whether we warn about installing to a
-        # directory not in sys.path.
-        self.force = 0
-        self.skip_build = 0
-        self.warn_dir = 1
+        self.cmd_opts.add_option(cmdoptions.ignore_requires_python())
+        self.cmd_opts.add_option(cmdoptions.no_build_isolation())
+        self.cmd_opts.add_option(cmdoptions.use_pep517())
+        self.cmd_opts.add_option(cmdoptions.no_use_pep517())
+        self.cmd_opts.add_option(cmdoptions.check_build_deps())
 
-        # These are only here as a conduit from the 'build' command to the
-        # 'install_*' commands that do the real work.  ('build_base' isn't
-        # actually used anywhere, but it might be useful in future.)  They
-        # are not user options, because if the user told the install
-        # command where the build directory is, that wouldn't affect the
-        # build command.
-        self.build_base = None
-        self.build_lib = None
+        self.cmd_opts.add_option(cmdoptions.config_settings())
+        self.cmd_opts.add_option(cmdoptions.install_options())
+        self.cmd_opts.add_option(cmdoptions.global_options())
 
-        # Not defined yet because we don't know anything about
-        # documentation yet.
-        # self.install_man = None
-        # self.install_html = None
-        # self.install_info = None
+        self.cmd_opts.add_option(
+            "--compile",
+            action="store_true",
+            dest="compile",
+            default=True,
+            help="Compile Python source files to bytecode",
+        )
 
-        self.record = None
+        self.cmd_opts.add_option(
+            "--no-compile",
+            action="store_false",
+            dest="compile",
+            help="Do not compile Python source files to bytecode",
+        )
 
-    # -- Option finalizing methods -------------------------------------
-    # (This is rather more involved than for most commands,
-    # because this is where the policy for installing third-
-    # party Python modules on various platforms given a wide
-    # array of user input is decided.  Yes, it's quite complex!)
+        self.cmd_opts.add_option(
+            "--no-warn-script-location",
+            action="store_false",
+            dest="warn_script_location",
+            default=True,
+            help="Do not warn when installing scripts outside PATH",
+        )
+        self.cmd_opts.add_option(
+            "--no-warn-conflicts",
+            action="store_false",
+            dest="warn_about_conflicts",
+            default=True,
+            help="Do not warn about broken dependencies",
+        )
+        self.cmd_opts.add_option(cmdoptions.no_binary())
+        self.cmd_opts.add_option(cmdoptions.only_binary())
+        self.cmd_opts.add_option(cmdoptions.prefer_binary())
+        self.cmd_opts.add_option(cmdoptions.require_hashes())
+        self.cmd_opts.add_option(cmdoptions.progress_bar())
+        self.cmd_opts.add_option(cmdoptions.root_user_action())
 
-    def finalize_options(self):
-        """Finalizes options."""
-        # This method (and its helpers, like 'finalize_unix()',
-        # 'finalize_other()', and 'select_scheme()') is where the default
-        # installation directories for modules, extension modules, and
-        # anything else we care to install from a Python module
-        # distribution.  Thus, this code makes a pretty important policy
-        # statement about how third-party stuff is added to a Python
-        # installation!  Note that the actual work of installation is done
-        # by the relatively simple 'install_*' commands; they just take
-        # their orders from the installation directory options determined
-        # here.
+        index_opts = cmdoptions.make_option_group(
+            cmdoptions.index_group,
+            self.parser,
+        )
 
-        # Check for errors/inconsistencies in the options; first, stuff
-        # that's wrong on any platform.
+        self.parser.insert_option_group(0, index_opts)
+        self.parser.insert_option_group(0, self.cmd_opts)
 
-        if (self.prefix or self.exec_prefix or self.home) and (
-            self.install_base or self.install_platbase
-        ):
-            raise DistutilsOptionError(
-                "must supply either prefix/exec-prefix/home or "
-                + "install-base/install-platbase -- not both"
-            )
+        self.cmd_opts.add_option(
+            "--report",
+            dest="json_report_file",
+            metavar="file",
+            default=None,
+            help=(
+                "Generate a JSON file describing what pip did to install "
+                "the provided requirements. "
+                "Can be used in combination with --dry-run and --ignore-installed "
+                "to 'resolve' the requirements. "
+                "When - is used as file name it writes to stdout."
+            ),
+        )
 
-        if self.home and (self.prefix or self.exec_prefix):
-            raise DistutilsOptionError(
-                "must supply either home or prefix/exec-prefix -- not both"
-            )
+    @with_cleanup
+    def run(self, options: Values, args: List[str]) -> int:
+        if options.use_user_site and options.target_dir is not None:
+            raise CommandError("Can not combine '--user' and '--target'")
 
-        if self.user and (
-            self.prefix
-            or self.exec_prefix
-            or self.home
-            or self.install_base
-            or self.install_platbase
-        ):
-            raise DistutilsOptionError(
-                "can't combine user with prefix, "
-                "exec_prefix/home, or install_(plat)base"
-            )
+        cmdoptions.check_install_build_global(options)
+        upgrade_strategy = "to-satisfy-only"
+        if options.upgrade:
+            upgrade_strategy = options.upgrade_strategy
 
-        # Next, stuff that's wrong (or dubious) only on certain platforms.
-        if os.name != "posix":
-            if self.exec_prefix:
-                self.warn("exec-prefix option ignored on this platform")
-                self.exec_prefix = None
+        cmdoptions.check_dist_restriction(options, check_target=True)
 
-        # Now the interesting logic -- so interesting that we farm it out
-        # to other methods.  The goal of these methods is to set the final
-        # values for the install_{lib,scripts,data,...}  options, using as
-        # input a heady brew of prefix, exec_prefix, home, install_base,
-        # install_platbase, user-supplied versions of
-        # install_{purelib,platlib,lib,scripts,data,...}, and the
-        # install schemes.  Phew!
+        install_options = options.install_options or []
 
-        self.dump_dirs("pre-finalize_{unix,other}")
+        logger.verbose("Using %s", get_pip_version())
+        options.use_user_site = decide_user_install(
+            options.use_user_site,
+            prefix_path=options.prefix_path,
+            target_dir=options.target_dir,
+            root_path=options.root_path,
+            isolated_mode=options.isolated_mode,
+        )
 
-        if os.name == 'posix':
-            self.finalize_unix()
-        else:
-            self.finalize_other()
+        target_temp_dir: Optional[TempDirectory] = None
+        target_temp_dir_path: Optional[str] = None
+        if options.target_dir:
+            options.ignore_installed = True
+            options.target_dir = os.path.abspath(options.target_dir)
+            if (
+                # fmt: off
+                os.path.exists(options.target_dir) and
+                not os.path.isdir(options.target_dir)
+                # fmt: on
+            ):
+                raise CommandError(
+                    "Target path exists but is not a directory, will not continue."
+                )
 
-        self.dump_dirs("post-finalize_{unix,other}()")
+            # Create a target directory for using with the target option
+            target_temp_dir = TempDirectory(kind="target")
+            target_temp_dir_path = target_temp_dir.path
+            self.enter_context(target_temp_dir)
 
-        # Expand configuration variables, tilde, etc. in self.install_base
-        # and self.install_platbase -- that way, we can use $base or
-        # $platbase in the other installation directories and not worry
-        # about needing recursive variable expansion (shudder).
+        global_options = options.global_options or []
 
-        py_version = sys.version.split()[0]
-        (prefix, exec_prefix) = get_config_vars('prefix', 'exec_prefix')
+        session = self.get_default_session(options)
+
+        target_python = make_target_python(options)
+        finder = self._build_package_finder(
+            options=options,
+            session=session,
+            target_python=target_python,
+            ignore_requires_python=options.ignore_requires_python,
+        )
+        wheel_cache = WheelCache(options.cache_dir, options.format_control)
+
+        build_tracker = self.enter_context(get_build_tracker())
+
+        directory = TempDirectory(
+            delete=not options.no_clean,
+            kind="install",
+            globally_managed=True,
+        )
+
         try:
-            abiflags = sys.abiflags
-        except AttributeError:
-            # sys.abiflags may not be defined on all platforms.
-            abiflags = ''
-        local_vars = {
-            'dist_name': self.distribution.get_name(),
-            'dist_version': self.distribution.get_version(),
-            'dist_fullname': self.distribution.get_fullname(),
-            'py_version': py_version,
-            'py_version_short': '%d.%d' % sys.version_info[:2],
-            'py_version_nodot': '%d%d' % sys.version_info[:2],
-            'sys_prefix': prefix,
-            'prefix': prefix,
-            'sys_exec_prefix': exec_prefix,
-            'exec_prefix': exec_prefix,
-            'abiflags': abiflags,
-            'platlibdir': getattr(sys, 'platlibdir', 'lib'),
-            'implementation_lower': _get_implementation().lower(),
-            'implementation': _get_implementation(),
-        }
+            reqs = self.get_requirements(args, options, finder, session)
 
-        # vars for compatibility on older Pythons
-        compat_vars = dict(
-            # Python 3.9 and earlier
-            py_version_nodot_plat=getattr(sys, 'winver', '').replace('.', ''),
-        )
+            # Only when installing is it permitted to use PEP 660.
+            # In other circumstances (pip wheel, pip download) we generate
+            # regular (i.e. non editable) metadata and wheels.
+            for req in reqs:
+                req.permit_editable_wheels = True
 
-        if HAS_USER_SITE:
-            local_vars['userbase'] = self.install_userbase
-            local_vars['usersite'] = self.install_usersite
+            reject_location_related_install_options(reqs, options.install_options)
 
-        self.config_vars = _collections.DictStack(
-            [fw.vars(), compat_vars, sysconfig.get_config_vars(), local_vars]
-        )
-
-        self.expand_basedirs()
-
-        self.dump_dirs("post-expand_basedirs()")
-
-        # Now define config vars for the base directories so we can expand
-        # everything else.
-        local_vars['base'] = self.install_base
-        local_vars['platbase'] = self.install_platbase
-
-        if DEBUG:
-            from pprint import pprint
-
-            print("config vars:")
-            pprint(dict(self.config_vars))
-
-        # Expand "~" and configuration variables in the installation
-        # directories.
-        self.expand_dirs()
-
-        self.dump_dirs("post-expand_dirs()")
-
-        # Create directories in the home dir:
-        if self.user:
-            self.create_home_path()
-
-        # Pick the actual directory to install all modules to: either
-        # install_purelib or install_platlib, depending on whether this
-        # module distribution is pure or not.  Of course, if the user
-        # already specified install_lib, use their selection.
-        if self.install_lib is None:
-            if self.distribution.has_ext_modules():  # has extensions: non-pure
-                self.install_lib = self.install_platlib
-            else:
-                self.install_lib = self.install_purelib
-
-        # Convert directories from Unix /-separated syntax to the local
-        # convention.
-        self.convert_paths(
-            'lib',
-            'purelib',
-            'platlib',
-            'scripts',
-            'data',
-            'headers',
-            'userbase',
-            'usersite',
-        )
-
-        # Deprecated
-        # Well, we're not actually fully completely finalized yet: we still
-        # have to deal with 'extra_path', which is the hack for allowing
-        # non-packagized module distributions (hello, Numerical Python!) to
-        # get their own directories.
-        self.handle_extra_path()
-        self.install_libbase = self.install_lib  # needed for .pth file
-        self.install_lib = os.path.join(self.install_lib, self.extra_dirs)
-
-        # If a new root directory was supplied, make all the installation
-        # dirs relative to it.
-        if self.root is not None:
-            self.change_roots(
-                'libbase', 'lib', 'purelib', 'platlib', 'scripts', 'data', 'headers'
+            preparer = self.make_requirement_preparer(
+                temp_build_dir=directory,
+                options=options,
+                build_tracker=build_tracker,
+                session=session,
+                finder=finder,
+                use_user_site=options.use_user_site,
+                verbosity=self.verbosity,
+            )
+            resolver = self.make_resolver(
+                preparer=preparer,
+                finder=finder,
+                options=options,
+                wheel_cache=wheel_cache,
+                use_user_site=options.use_user_site,
+                ignore_installed=options.ignore_installed,
+                ignore_requires_python=options.ignore_requires_python,
+                force_reinstall=options.force_reinstall,
+                upgrade_strategy=upgrade_strategy,
+                use_pep517=options.use_pep517,
             )
 
-        self.dump_dirs("after prepending root")
+            self.trace_basic_info(finder)
 
-        # Find out the build directories, ie. where to install from.
-        self.set_undefined_options(
-            'build', ('build_base', 'build_base'), ('build_lib', 'build_lib')
-        )
-
-        # Punt on doc directories for now -- after all, we're punting on
-        # documentation completely!
-
-    def dump_dirs(self, msg):
-        """Dumps the list of user options."""
-        if not DEBUG:
-            return
-        from distutils.fancy_getopt import longopt_xlate
-
-        log.debug(msg + ":")
-        for opt in self.user_options:
-            opt_name = opt[0]
-            if opt_name[-1] == "=":
-                opt_name = opt_name[0:-1]
-            if opt_name in self.negative_opt:
-                opt_name = self.negative_opt[opt_name]
-                opt_name = opt_name.translate(longopt_xlate)
-                val = not getattr(self, opt_name)
-            else:
-                opt_name = opt_name.translate(longopt_xlate)
-                val = getattr(self, opt_name)
-            log.debug("  %s: %s", opt_name, val)
-
-    def finalize_unix(self):
-        """Finalizes options for posix platforms."""
-        if self.install_base is not None or self.install_platbase is not None:
-            incomplete_scheme = (
-                (
-                    self.install_lib is None
-                    and self.install_purelib is None
-                    and self.install_platlib is None
-                )
-                or self.install_headers is None
-                or self.install_scripts is None
-                or self.install_data is None
+            requirement_set = resolver.resolve(
+                reqs, check_supported_wheels=not options.target_dir
             )
-            if incomplete_scheme:
-                raise DistutilsOptionError(
-                    "install-base or install-platbase supplied, but "
-                    "installation scheme is incomplete"
-                )
-            return
 
-        if self.user:
-            if self.install_userbase is None:
-                raise DistutilsPlatformError("User base directory is not specified")
-            self.install_base = self.install_platbase = self.install_userbase
-            self.select_scheme("posix_user")
-        elif self.home is not None:
-            self.install_base = self.install_platbase = self.home
-            self.select_scheme("posix_home")
-        else:
-            if self.prefix is None:
-                if self.exec_prefix is not None:
-                    raise DistutilsOptionError(
-                        "must not supply exec-prefix without prefix"
+            if options.json_report_file:
+                logger.warning(
+                    "--report is currently an experimental option. "
+                    "The output format may change in a future release "
+                    "without prior warning."
+                )
+
+                report = InstallationReport(requirement_set.requirements_to_install)
+                if options.json_report_file == "-":
+                    print_json(data=report.to_dict())
+                else:
+                    with open(options.json_report_file, "w", encoding="utf-8") as f:
+                        json.dump(report.to_dict(), f, indent=2, ensure_ascii=False)
+
+            if options.dry_run:
+                would_install_items = sorted(
+                    (r.metadata["name"], r.metadata["version"])
+                    for r in requirement_set.requirements_to_install
+                )
+                if would_install_items:
+                    write_output(
+                        "Would install %s",
+                        " ".join("-".join(item) for item in would_install_items),
                     )
+                return SUCCESS
 
-                # Allow Fedora to add components to the prefix
-                _prefix_addition = getattr(sysconfig, '_prefix_addition', "")
-
-                self.prefix = os.path.normpath(sys.prefix) + _prefix_addition
-                self.exec_prefix = os.path.normpath(sys.exec_prefix) + _prefix_addition
-
-            else:
-                if self.exec_prefix is None:
-                    self.exec_prefix = self.prefix
-
-            self.install_base = self.prefix
-            self.install_platbase = self.exec_prefix
-            self.select_scheme("posix_prefix")
-
-    def finalize_other(self):
-        """Finalizes options for non-posix platforms"""
-        if self.user:
-            if self.install_userbase is None:
-                raise DistutilsPlatformError("User base directory is not specified")
-            self.install_base = self.install_platbase = self.install_userbase
-            self.select_scheme(os.name + "_user")
-        elif self.home is not None:
-            self.install_base = self.install_platbase = self.home
-            self.select_scheme("posix_home")
-        else:
-            if self.prefix is None:
-                self.prefix = os.path.normpath(sys.prefix)
-
-            self.install_base = self.install_platbase = self.prefix
             try:
-                self.select_scheme(os.name)
+                pip_req = requirement_set.get_requirement("pip")
             except KeyError:
-                raise DistutilsPlatformError(
-                    "I don't know how to install stuff on '%s'" % os.name
-                )
-
-    def select_scheme(self, name):
-        _select_scheme(self, name)
-
-    def _expand_attrs(self, attrs):
-        for attr in attrs:
-            val = getattr(self, attr)
-            if val is not None:
-                if os.name == 'posix' or os.name == 'nt':
-                    val = os.path.expanduser(val)
-                val = subst_vars(val, self.config_vars)
-                setattr(self, attr, val)
-
-    def expand_basedirs(self):
-        """Calls `os.path.expanduser` on install_base, install_platbase and
-        root."""
-        self._expand_attrs(['install_base', 'install_platbase', 'root'])
-
-    def expand_dirs(self):
-        """Calls `os.path.expanduser` on install dirs."""
-        self._expand_attrs(
-            [
-                'install_purelib',
-                'install_platlib',
-                'install_lib',
-                'install_headers',
-                'install_scripts',
-                'install_data',
-            ]
-        )
-
-    def convert_paths(self, *names):
-        """Call `convert_path` over `names`."""
-        for name in names:
-            attr = "install_" + name
-            setattr(self, attr, convert_path(getattr(self, attr)))
-
-    def handle_extra_path(self):
-        """Set `path_file` and `extra_dirs` using `extra_path`."""
-        if self.extra_path is None:
-            self.extra_path = self.distribution.extra_path
-
-        if self.extra_path is not None:
-            log.warn(
-                "Distribution option extra_path is deprecated. "
-                "See issue27919 for details."
-            )
-            if isinstance(self.extra_path, str):
-                self.extra_path = self.extra_path.split(',')
-
-            if len(self.extra_path) == 1:
-                path_file = extra_dirs = self.extra_path[0]
-            elif len(self.extra_path) == 2:
-                path_file, extra_dirs = self.extra_path
+                modifying_pip = False
             else:
-                raise DistutilsOptionError(
-                    "'extra_path' option must be a list, tuple, or "
-                    "comma-separated string with 1 or 2 elements"
+                # If we're not replacing an already installed pip,
+                # we're not modifying it.
+                modifying_pip = pip_req.satisfied_by is None
+            protect_pip_from_modification_on_windows(modifying_pip=modifying_pip)
+
+            check_binary_allowed = get_check_binary_allowed(finder.format_control)
+
+            reqs_to_build = [
+                r
+                for r in requirement_set.requirements.values()
+                if should_build_for_install_command(r, check_binary_allowed)
+            ]
+
+            _, build_failures = build(
+                reqs_to_build,
+                wheel_cache=wheel_cache,
+                verify=True,
+                build_options=[],
+                global_options=[],
+            )
+
+            # If we're using PEP 517, we cannot do a legacy setup.py install
+            # so we fail here.
+            pep517_build_failure_names: List[str] = [
+                r.name for r in build_failures if r.use_pep517  # type: ignore
+            ]
+            if pep517_build_failure_names:
+                raise InstallationError(
+                    "Could not build wheels for {}, which is required to "
+                    "install pyproject.toml-based projects".format(
+                        ", ".join(pep517_build_failure_names)
+                    )
                 )
 
-            # convert to local form in case Unix notation used (as it
-            # should be in setup scripts)
-            extra_dirs = convert_path(extra_dirs)
-        else:
-            path_file = None
-            extra_dirs = ''
+            # For now, we just warn about failures building legacy
+            # requirements, as we'll fall through to a setup.py install for
+            # those.
+            for r in build_failures:
+                if not r.use_pep517:
+                    r.legacy_install_reason = 8368
 
-        # XXX should we warn if path_file and not extra_dirs? (in which
-        # case the path file would be harmless but pointless)
-        self.path_file = path_file
-        self.extra_dirs = extra_dirs
+            to_install = resolver.get_installation_order(requirement_set)
 
-    def change_roots(self, *names):
-        """Change the install directories pointed by name using root."""
-        for name in names:
-            attr = "install_" + name
-            setattr(self, attr, change_root(self.root, getattr(self, attr)))
+            # Check for conflicts in the package set we're installing.
+            conflicts: Optional[ConflictDetails] = None
+            should_warn_about_conflicts = (
+                not options.ignore_dependencies and options.warn_about_conflicts
+            )
+            if should_warn_about_conflicts:
+                conflicts = self._determine_conflicts(to_install)
 
-    def create_home_path(self):
-        """Create directories under ~."""
-        if not self.user:
+            # Don't warn about script install locations if
+            # --target or --prefix has been specified
+            warn_script_location = options.warn_script_location
+            if options.target_dir or options.prefix_path:
+                warn_script_location = False
+
+            installed = install_given_reqs(
+                to_install,
+                install_options,
+                global_options,
+                root=options.root_path,
+                home=target_temp_dir_path,
+                prefix=options.prefix_path,
+                warn_script_location=warn_script_location,
+                use_user_site=options.use_user_site,
+                pycompile=options.compile,
+            )
+
+            lib_locations = get_lib_location_guesses(
+                user=options.use_user_site,
+                home=target_temp_dir_path,
+                root=options.root_path,
+                prefix=options.prefix_path,
+                isolated=options.isolated_mode,
+            )
+            env = get_environment(lib_locations)
+
+            installed.sort(key=operator.attrgetter("name"))
+            items = []
+            for result in installed:
+                item = result.name
+                try:
+                    installed_dist = env.get_distribution(item)
+                    if installed_dist is not None:
+                        item = f"{item}-{installed_dist.version}"
+                except Exception:
+                    pass
+                items.append(item)
+
+            if conflicts is not None:
+                self._warn_about_conflicts(
+                    conflicts,
+                    resolver_variant=self.determine_resolver_variant(options),
+                )
+
+            installed_desc = " ".join(items)
+            if installed_desc:
+                write_output(
+                    "Successfully installed %s",
+                    installed_desc,
+                )
+        except OSError as error:
+            show_traceback = self.verbosity >= 1
+
+            message = create_os_error_message(
+                error,
+                show_traceback,
+                options.use_user_site,
+            )
+            logger.error(message, exc_info=show_traceback)  # noqa
+
+            return ERROR
+
+        if options.target_dir:
+            assert target_temp_dir
+            self._handle_target_dir(
+                options.target_dir, target_temp_dir, options.upgrade
+            )
+        if options.root_user_action == "warn":
+            warn_if_run_as_root()
+        return SUCCESS
+
+    def _handle_target_dir(
+        self, target_dir: str, target_temp_dir: TempDirectory, upgrade: bool
+    ) -> None:
+        ensure_dir(target_dir)
+
+        # Checking both purelib and platlib directories for installed
+        # packages to be moved to target directory
+        lib_dir_list = []
+
+        # Checking both purelib and platlib directories for installed
+        # packages to be moved to target directory
+        scheme = get_scheme("", home=target_temp_dir.path)
+        purelib_dir = scheme.purelib
+        platlib_dir = scheme.platlib
+        data_dir = scheme.data
+
+        if os.path.exists(purelib_dir):
+            lib_dir_list.append(purelib_dir)
+        if os.path.exists(platlib_dir) and platlib_dir != purelib_dir:
+            lib_dir_list.append(platlib_dir)
+        if os.path.exists(data_dir):
+            lib_dir_list.append(data_dir)
+
+        for lib_dir in lib_dir_list:
+            for item in os.listdir(lib_dir):
+                if lib_dir == data_dir:
+                    ddir = os.path.join(data_dir, item)
+                    if any(s.startswith(ddir) for s in lib_dir_list[:-1]):
+                        continue
+                target_item_dir = os.path.join(target_dir, item)
+                if os.path.exists(target_item_dir):
+                    if not upgrade:
+                        logger.warning(
+                            "Target directory %s already exists. Specify "
+                            "--upgrade to force replacement.",
+                            target_item_dir,
+                        )
+                        continue
+                    if os.path.islink(target_item_dir):
+                        logger.warning(
+                            "Target directory %s already exists and is "
+                            "a link. pip will not automatically replace "
+                            "links, please remove if replacement is "
+                            "desired.",
+                            target_item_dir,
+                        )
+                        continue
+                    if os.path.isdir(target_item_dir):
+                        shutil.rmtree(target_item_dir)
+                    else:
+                        os.remove(target_item_dir)
+
+                shutil.move(os.path.join(lib_dir, item), target_item_dir)
+
+    def _determine_conflicts(
+        self, to_install: List[InstallRequirement]
+    ) -> Optional[ConflictDetails]:
+        try:
+            return check_install_conflicts(to_install)
+        except Exception:
+            logger.exception(
+                "Error while checking for conflicts. Please file an issue on "
+                "pip's issue tracker: https://github.com/pypa/pip/issues/new"
+            )
+            return None
+
+    def _warn_about_conflicts(
+        self, conflict_details: ConflictDetails, resolver_variant: str
+    ) -> None:
+        package_set, (missing, conflicting) = conflict_details
+        if not missing and not conflicting:
             return
-        home = convert_path(os.path.expanduser("~"))
-        for name, path in self.config_vars.items():
-            if str(path).startswith(home) and not os.path.isdir(path):
-                self.debug_print("os.makedirs('%s', 0o700)" % path)
-                os.makedirs(path, 0o700)
 
-    # -- Command execution methods -------------------------------------
-
-    def run(self):
-        """Runs the command."""
-        # Obviously have to build before we can install
-        if not self.skip_build:
-            self.run_command('build')
-            # If we built for any other platform, we can't install.
-            build_plat = self.distribution.get_command_obj('build').plat_name
-            # check warn_dir - it is a clue that the 'install' is happening
-            # internally, and not to sys.path, so we don't check the platform
-            # matches what we are running.
-            if self.warn_dir and build_plat != get_platform():
-                raise DistutilsPlatformError("Can't install when " "cross-compiling")
-
-        # Run all sub-commands (at least those that need to be run)
-        for cmd_name in self.get_sub_commands():
-            self.run_command(cmd_name)
-
-        if self.path_file:
-            self.create_path_file()
-
-        # write list of installed files, if requested.
-        if self.record:
-            outputs = self.get_outputs()
-            if self.root:  # strip any package prefix
-                root_len = len(self.root)
-                for counter in range(len(outputs)):
-                    outputs[counter] = outputs[counter][root_len:]
-            self.execute(
-                write_file,
-                (self.record, outputs),
-                "writing list of installed files to '%s'" % self.record,
-            )
-
-        sys_path = map(os.path.normpath, sys.path)
-        sys_path = map(os.path.normcase, sys_path)
-        install_lib = os.path.normcase(os.path.normpath(self.install_lib))
-        if (
-            self.warn_dir
-            and not (self.path_file and self.install_path_file)
-            and install_lib not in sys_path
-        ):
-            log.debug(
-                (
-                    "modules installed to '%s', which is not in "
-                    "Python's module search path (sys.path) -- "
-                    "you'll have to change the search path yourself"
-                ),
-                self.install_lib,
-            )
-
-    def create_path_file(self):
-        """Creates the .pth file"""
-        filename = os.path.join(self.install_libbase, self.path_file + ".pth")
-        if self.install_path_file:
-            self.execute(
-                write_file, (filename, [self.extra_dirs]), "creating %s" % filename
+        parts: List[str] = []
+        if resolver_variant == "legacy":
+            parts.append(
+                "pip's legacy dependency resolver does not consider dependency "
+                "conflicts when selecting packages. This behaviour is the "
+                "source of the following dependency conflicts."
             )
         else:
-            self.warn("path file '%s' not created" % filename)
+            assert resolver_variant == "2020-resolver"
+            parts.append(
+                "pip's dependency resolver does not currently take into account "
+                "all the packages that are installed. This behaviour is the "
+                "source of the following dependency conflicts."
+            )
 
-    # -- Reporting methods ---------------------------------------------
+        # NOTE: There is some duplication here, with commands/check.py
+        for project_name in missing:
+            version = package_set[project_name][0]
+            for dependency in missing[project_name]:
+                message = (
+                    "{name} {version} requires {requirement}, "
+                    "which is not installed."
+                ).format(
+                    name=project_name,
+                    version=version,
+                    requirement=dependency[1],
+                )
+                parts.append(message)
 
-    def get_outputs(self):
-        """Assembles the outputs of all the sub-commands."""
-        outputs = []
-        for cmd_name in self.get_sub_commands():
-            cmd = self.get_finalized_command(cmd_name)
-            # Add the contents of cmd.get_outputs(), ensuring
-            # that outputs doesn't contain duplicate entries
-            for filename in cmd.get_outputs():
-                if filename not in outputs:
-                    outputs.append(filename)
+        for project_name in conflicting:
+            version = package_set[project_name][0]
+            for dep_name, dep_version, req in conflicting[project_name]:
+                message = (
+                    "{name} {version} requires {requirement}, but {you} have "
+                    "{dep_name} {dep_version} which is incompatible."
+                ).format(
+                    name=project_name,
+                    version=version,
+                    requirement=req,
+                    dep_name=dep_name,
+                    dep_version=dep_version,
+                    you=("you" if resolver_variant == "2020-resolver" else "you'll"),
+                )
+                parts.append(message)
 
-        if self.path_file and self.install_path_file:
-            outputs.append(os.path.join(self.install_libbase, self.path_file + ".pth"))
+        logger.critical("\n".join(parts))
 
-        return outputs
 
-    def get_inputs(self):
-        """Returns the inputs of all the sub-commands"""
-        # XXX gee, this looks familiar ;-(
-        inputs = []
-        for cmd_name in self.get_sub_commands():
-            cmd = self.get_finalized_command(cmd_name)
-            inputs.extend(cmd.get_inputs())
+def get_lib_location_guesses(
+    user: bool = False,
+    home: Optional[str] = None,
+    root: Optional[str] = None,
+    isolated: bool = False,
+    prefix: Optional[str] = None,
+) -> List[str]:
+    scheme = get_scheme(
+        "",
+        user=user,
+        home=home,
+        root=root,
+        isolated=isolated,
+        prefix=prefix,
+    )
+    return [scheme.purelib, scheme.platlib]
 
-        return inputs
 
-    # -- Predicates for sub-command list -------------------------------
+def site_packages_writable(root: Optional[str], isolated: bool) -> bool:
+    return all(
+        test_writable_dir(d)
+        for d in set(get_lib_location_guesses(root=root, isolated=isolated))
+    )
 
-    def has_lib(self):
-        """Returns true if the current distribution has any Python
-        modules to install."""
-        return (
-            self.distribution.has_pure_modules() or self.distribution.has_ext_modules()
+
+def decide_user_install(
+    use_user_site: Optional[bool],
+    prefix_path: Optional[str] = None,
+    target_dir: Optional[str] = None,
+    root_path: Optional[str] = None,
+    isolated_mode: bool = False,
+) -> bool:
+    """Determine whether to do a user install based on the input options.
+
+    If use_user_site is False, no additional checks are done.
+    If use_user_site is True, it is checked for compatibility with other
+    options.
+    If use_user_site is None, the default behaviour depends on the environment,
+    which is provided by the other arguments.
+    """
+    # In some cases (config from tox), use_user_site can be set to an integer
+    # rather than a bool, which 'use_user_site is False' wouldn't catch.
+    if (use_user_site is not None) and (not use_user_site):
+        logger.debug("Non-user install by explicit request")
+        return False
+
+    if use_user_site:
+        if prefix_path:
+            raise CommandError(
+                "Can not combine '--user' and '--prefix' as they imply "
+                "different installation locations"
+            )
+        if virtualenv_no_global():
+            raise InstallationError(
+                "Can not perform a '--user' install. User site-packages "
+                "are not visible in this virtualenv."
+            )
+        logger.debug("User install by explicit request")
+        return True
+
+    # If we are here, user installs have not been explicitly requested/avoided
+    assert use_user_site is None
+
+    # user install incompatible with --prefix/--target
+    if prefix_path or target_dir:
+        logger.debug("Non-user install due to --prefix or --target option")
+        return False
+
+    # If user installs are not enabled, choose a non-user install
+    if not site.ENABLE_USER_SITE:
+        logger.debug("Non-user install because user site-packages disabled")
+        return False
+
+    # If we have permission for a non-user install, do that,
+    # otherwise do a user install.
+    if site_packages_writable(root=root_path, isolated=isolated_mode):
+        logger.debug("Non-user install because site-packages writeable")
+        return False
+
+    logger.info(
+        "Defaulting to user installation because normal site-packages "
+        "is not writeable"
+    )
+    return True
+
+
+def reject_location_related_install_options(
+    requirements: List[InstallRequirement], options: Optional[List[str]]
+) -> None:
+    """If any location-changing --install-option arguments were passed for
+    requirements or on the command-line, then show a deprecation warning.
+    """
+
+    def format_options(option_names: Iterable[str]) -> List[str]:
+        return ["--{}".format(name.replace("_", "-")) for name in option_names]
+
+    offenders = []
+
+    for requirement in requirements:
+        install_options = requirement.install_options
+        location_options = parse_distutils_args(install_options)
+        if location_options:
+            offenders.append(
+                "{!r} from {}".format(
+                    format_options(location_options.keys()), requirement
+                )
+            )
+
+    if options:
+        location_options = parse_distutils_args(options)
+        if location_options:
+            offenders.append(
+                "{!r} from command line".format(format_options(location_options.keys()))
+            )
+
+    if not offenders:
+        return
+
+    raise CommandError(
+        "Location-changing options found in --install-option: {}."
+        " This is unsupported, use pip-level options like --user,"
+        " --prefix, --root, and --target instead.".format("; ".join(offenders))
+    )
+
+
+def create_os_error_message(
+    error: OSError, show_traceback: bool, using_user_site: bool
+) -> str:
+    """Format an error message for an OSError
+
+    It may occur anytime during the execution of the install command.
+    """
+    parts = []
+
+    # Mention the error if we are not going to show a traceback
+    parts.append("Could not install packages due to an OSError")
+    if not show_traceback:
+        parts.append(": ")
+        parts.append(str(error))
+    else:
+        parts.append(".")
+
+    # Spilt the error indication from a helper message (if any)
+    parts[-1] += "\n"
+
+    # Suggest useful actions to the user:
+    #  (1) using user site-packages or (2) verifying the permissions
+    if error.errno == errno.EACCES:
+        user_option_part = "Consider using the `--user` option"
+        permissions_part = "Check the permissions"
+
+        if not running_under_virtualenv() and not using_user_site:
+            parts.extend(
+                [
+                    user_option_part,
+                    " or ",
+                    permissions_part.lower(),
+                ]
+            )
+        else:
+            parts.append(permissions_part)
+        parts.append(".\n")
+
+    # Suggest the user to enable Long Paths if path length is
+    # more than 260
+    if (
+        WINDOWS
+        and error.errno == errno.ENOENT
+        and error.filename
+        and len(error.filename) > 260
+    ):
+        parts.append(
+            "HINT: This error might have occurred since "
+            "this system does not have Windows Long Path "
+            "support enabled. You can find information on "
+            "how to enable this at "
+            "https://pip.pypa.io/warnings/enable-long-paths\n"
         )
 
-    def has_headers(self):
-        """Returns true if the current distribution has any headers to
-        install."""
-        return self.distribution.has_headers()
-
-    def has_scripts(self):
-        """Returns true if the current distribution has any scripts to.
-        install."""
-        return self.distribution.has_scripts()
-
-    def has_data(self):
-        """Returns true if the current distribution has any data to.
-        install."""
-        return self.distribution.has_data_files()
-
-    # 'sub_commands': a list of commands this command might have to run to
-    # get its work done.  See cmd.py for more info.
-    sub_commands = [
-        ('install_lib', has_lib),
-        ('install_headers', has_headers),
-        ('install_scripts', has_scripts),
-        ('install_data', has_data),
-        ('install_egg_info', lambda self: True),
-    ]
+    return "".join(parts).strip() + "\n"
