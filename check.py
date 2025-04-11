@@ -1,207 +1,149 @@
-"""Check a project and backend by attempting to build using PEP 517 hooks.
+"""Validation of dependencies of packages
 """
-import argparse
-import io
+
 import logging
-import os
-from os.path import isfile, join as pjoin
-import shutil
-from subprocess import CalledProcessError
-import sys
-import tarfile
-from tempfile import mkdtemp
-import zipfile
+from typing import Callable, Dict, List, NamedTuple, Optional, Set, Tuple
 
-from .colorlog import enable_colourful_output
-from .compat import TOMLDecodeError, toml_load
-from .envbuild import BuildEnvironment
-from .wrappers import Pep517HookCaller
+from pip._vendor.packaging.requirements import Requirement
+from pip._vendor.packaging.utils import NormalizedName, canonicalize_name
 
-log = logging.getLogger(__name__)
+from pip._internal.distributions import make_distribution_for_install_requirement
+from pip._internal.metadata import get_default_environment
+from pip._internal.metadata.base import DistributionVersion
+from pip._internal.req.req_install import InstallRequirement
+
+logger = logging.getLogger(__name__)
 
 
-def check_build_sdist(hooks, build_sys_requires):
-    with BuildEnvironment() as env:
+class PackageDetails(NamedTuple):
+    version: DistributionVersion
+    dependencies: List[Requirement]
+
+
+# Shorthands
+PackageSet = Dict[NormalizedName, PackageDetails]
+Missing = Tuple[NormalizedName, Requirement]
+Conflicting = Tuple[NormalizedName, DistributionVersion, Requirement]
+
+MissingDict = Dict[NormalizedName, List[Missing]]
+ConflictingDict = Dict[NormalizedName, List[Conflicting]]
+CheckResult = Tuple[MissingDict, ConflictingDict]
+ConflictDetails = Tuple[PackageSet, CheckResult]
+
+
+def create_package_set_from_installed() -> Tuple[PackageSet, bool]:
+    """Converts a list of distributions into a PackageSet."""
+    package_set = {}
+    problems = False
+    env = get_default_environment()
+    for dist in env.iter_installed_distributions(local_only=False, skip=()):
+        name = dist.canonical_name
         try:
-            env.pip_install(build_sys_requires)
-            log.info('Installed static build dependencies')
-        except CalledProcessError:
-            log.error('Failed to install static build dependencies')
-            return False
-
-        try:
-            reqs = hooks.get_requires_for_build_sdist({})
-            log.info('Got build requires: %s', reqs)
-        except Exception:
-            log.error('Failure in get_requires_for_build_sdist', exc_info=True)
-            return False
-
-        try:
-            env.pip_install(reqs)
-            log.info('Installed dynamic build dependencies')
-        except CalledProcessError:
-            log.error('Failed to install dynamic build dependencies')
-            return False
-
-        td = mkdtemp()
-        log.info('Trying to build sdist in %s', td)
-        try:
-            try:
-                filename = hooks.build_sdist(td, {})
-                log.info('build_sdist returned %r', filename)
-            except Exception:
-                log.info('Failure in build_sdist', exc_info=True)
-                return False
-
-            if not filename.endswith('.tar.gz'):
-                log.error(
-                    "Filename %s doesn't have .tar.gz extension", filename)
-                return False
-
-            path = pjoin(td, filename)
-            if isfile(path):
-                log.info("Output file %s exists", path)
-            else:
-                log.error("Output file %s does not exist", path)
-                return False
-
-            if tarfile.is_tarfile(path):
-                log.info("Output file is a tar file")
-            else:
-                log.error("Output file is not a tar file")
-                return False
-
-        finally:
-            shutil.rmtree(td)
-
-        return True
+            dependencies = list(dist.iter_dependencies())
+            package_set[name] = PackageDetails(dist.version, dependencies)
+        except (OSError, ValueError) as e:
+            # Don't crash on unreadable or broken metadata.
+            logger.warning("Error parsing requirements for %s: %s", name, e)
+            problems = True
+    return package_set, problems
 
 
-def check_build_wheel(hooks, build_sys_requires):
-    with BuildEnvironment() as env:
-        try:
-            env.pip_install(build_sys_requires)
-            log.info('Installed static build dependencies')
-        except CalledProcessError:
-            log.error('Failed to install static build dependencies')
-            return False
+def check_package_set(
+    package_set: PackageSet, should_ignore: Optional[Callable[[str], bool]] = None
+) -> CheckResult:
+    """Check if a package set is consistent
 
-        try:
-            reqs = hooks.get_requires_for_build_wheel({})
-            log.info('Got build requires: %s', reqs)
-        except Exception:
-            log.error('Failure in get_requires_for_build_sdist', exc_info=True)
-            return False
+    If should_ignore is passed, it should be a callable that takes a
+    package name and returns a boolean.
+    """
 
-        try:
-            env.pip_install(reqs)
-            log.info('Installed dynamic build dependencies')
-        except CalledProcessError:
-            log.error('Failed to install dynamic build dependencies')
-            return False
+    missing = {}
+    conflicting = {}
 
-        td = mkdtemp()
-        log.info('Trying to build wheel in %s', td)
-        try:
-            try:
-                filename = hooks.build_wheel(td, {})
-                log.info('build_wheel returned %r', filename)
-            except Exception:
-                log.info('Failure in build_wheel', exc_info=True)
-                return False
+    for package_name, package_detail in package_set.items():
+        # Info about dependencies of package_name
+        missing_deps: Set[Missing] = set()
+        conflicting_deps: Set[Conflicting] = set()
 
-            if not filename.endswith('.whl'):
-                log.error("Filename %s doesn't have .whl extension", filename)
-                return False
+        if should_ignore and should_ignore(package_name):
+            continue
 
-            path = pjoin(td, filename)
-            if isfile(path):
-                log.info("Output file %s exists", path)
-            else:
-                log.error("Output file %s does not exist", path)
-                return False
+        for req in package_detail.dependencies:
+            name = canonicalize_name(req.name)
 
-            if zipfile.is_zipfile(path):
-                log.info("Output file is a zip file")
-            else:
-                log.error("Output file is not a zip file")
-                return False
+            # Check if it's missing
+            if name not in package_set:
+                missed = True
+                if req.marker is not None:
+                    missed = req.marker.evaluate()
+                if missed:
+                    missing_deps.add((name, req))
+                continue
 
-        finally:
-            shutil.rmtree(td)
+            # Check if there's a conflict
+            version = package_set[name].version
+            if not req.specifier.contains(version, prereleases=True):
+                conflicting_deps.add((name, version, req))
 
-        return True
+        if missing_deps:
+            missing[package_name] = sorted(missing_deps, key=str)
+        if conflicting_deps:
+            conflicting[package_name] = sorted(conflicting_deps, key=str)
+
+    return missing, conflicting
 
 
-def check(source_dir):
-    pyproject = pjoin(source_dir, 'pyproject.toml')
-    if isfile(pyproject):
-        log.info('Found pyproject.toml')
-    else:
-        log.error('Missing pyproject.toml')
-        return False
+def check_install_conflicts(to_install: List[InstallRequirement]) -> ConflictDetails:
+    """For checking if the dependency graph would be consistent after \
+    installing given requirements
+    """
+    # Start from the current state
+    package_set, _ = create_package_set_from_installed()
+    # Install packages
+    would_be_installed = _simulate_installation_of(to_install, package_set)
 
-    try:
-        with io.open(pyproject, 'rb') as f:
-            pyproject_data = toml_load(f)
-        # Ensure the mandatory data can be loaded
-        buildsys = pyproject_data['build-system']
-        requires = buildsys['requires']
-        backend = buildsys['build-backend']
-        backend_path = buildsys.get('backend-path')
-        log.info('Loaded pyproject.toml')
-    except (TOMLDecodeError, KeyError):
-        log.error("Invalid pyproject.toml", exc_info=True)
-        return False
+    # Only warn about directly-dependent packages; create a whitelist of them
+    whitelist = _create_whitelist(would_be_installed, package_set)
 
-    hooks = Pep517HookCaller(source_dir, backend, backend_path)
-
-    sdist_ok = check_build_sdist(hooks, requires)
-    wheel_ok = check_build_wheel(hooks, requires)
-
-    if not sdist_ok:
-        log.warning('Sdist checks failed; scroll up to see')
-    if not wheel_ok:
-        log.warning('Wheel checks failed')
-
-    return sdist_ok
+    return (
+        package_set,
+        check_package_set(
+            package_set, should_ignore=lambda name: name not in whitelist
+        ),
+    )
 
 
-def main(argv=None):
-    log.warning('pep517.check is deprecated. '
-                'Consider switching to https://pypi.org/project/build/')
+def _simulate_installation_of(
+    to_install: List[InstallRequirement], package_set: PackageSet
+) -> Set[NormalizedName]:
+    """Computes the version of packages after installing to_install."""
+    # Keep track of packages that were installed
+    installed = set()
 
-    ap = argparse.ArgumentParser()
-    ap.add_argument(
-        'source_dir',
-        help="A directory containing pyproject.toml")
-    args = ap.parse_args(argv)
+    # Modify it as installing requirement_set would (assuming no errors)
+    for inst_req in to_install:
+        abstract_dist = make_distribution_for_install_requirement(inst_req)
+        dist = abstract_dist.get_metadata_distribution()
+        name = dist.canonical_name
+        package_set[name] = PackageDetails(dist.version, list(dist.iter_dependencies()))
 
-    enable_colourful_output()
+        installed.add(name)
 
-    ok = check(args.source_dir)
-
-    if ok:
-        print(ansi('Checks passed', 'green'))
-    else:
-        print(ansi('Checks failed', 'red'))
-        sys.exit(1)
+    return installed
 
 
-ansi_codes = {
-    'reset': '\x1b[0m',
-    'bold': '\x1b[1m',
-    'red': '\x1b[31m',
-    'green': '\x1b[32m',
-}
+def _create_whitelist(
+    would_be_installed: Set[NormalizedName], package_set: PackageSet
+) -> Set[NormalizedName]:
+    packages_affected = set(would_be_installed)
 
+    for package_name in package_set:
+        if package_name in packages_affected:
+            continue
 
-def ansi(s, attr):
-    if os.name != 'nt' and sys.stdout.isatty():
-        return ansi_codes[attr] + str(s) + ansi_codes['reset']
-    else:
-        return str(s)
+        for req in package_set[package_name].dependencies:
+            if canonicalize_name(req.name) in packages_affected:
+                packages_affected.add(package_name)
+                break
 
-
-if __name__ == '__main__':
-    main()
+    return packages_affected
