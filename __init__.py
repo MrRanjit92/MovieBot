@@ -1,83 +1,153 @@
 """
-    Pygments
-    ~~~~~~~~
+    pygments.formatters
+    ~~~~~~~~~~~~~~~~~~~
 
-    Pygments is a syntax highlighting package written in Python.
-
-    It is a generic syntax highlighter for general use in all kinds of software
-    such as forum systems, wikis or other applications that need to prettify
-    source code. Highlights are:
-
-    * a wide range of common languages and markup formats is supported
-    * special attention is paid to details, increasing quality by a fair amount
-    * support for new languages and formats are added easily
-    * a number of output formats, presently HTML, LaTeX, RTF, SVG, all image
-      formats that PIL supports, and ANSI sequences
-    * it is usable as a command-line tool and as a library
-    * ... and it highlights even Brainfuck!
-
-    The `Pygments master branch`_ is installable with ``easy_install Pygments==dev``.
-
-    .. _Pygments master branch:
-       https://github.com/pygments/pygments/archive/master.zip#egg=Pygments-dev
+    Pygments formatters.
 
     :copyright: Copyright 2006-2022 by the Pygments team, see AUTHORS.
     :license: BSD, see LICENSE for details.
 """
-from io import StringIO, BytesIO
 
-__version__ = '2.12.0'
-__docformat__ = 'restructuredtext'
+import re
+import sys
+import types
+import fnmatch
+from os.path import basename
 
-__all__ = ['lex', 'format', 'highlight']
+from pip._vendor.pygments.formatters._mapping import FORMATTERS
+from pip._vendor.pygments.plugin import find_plugin_formatters
+from pip._vendor.pygments.util import ClassNotFound
+
+__all__ = ['get_formatter_by_name', 'get_formatter_for_filename',
+           'get_all_formatters', 'load_formatter_from_file'] + list(FORMATTERS)
+
+_formatter_cache = {}  # classes by name
+_pattern_cache = {}
 
 
-def lex(code, lexer):
+def _fn_matches(fn, glob):
+    """Return whether the supplied file name fn matches pattern filename."""
+    if glob not in _pattern_cache:
+        pattern = _pattern_cache[glob] = re.compile(fnmatch.translate(glob))
+        return pattern.match(fn)
+    return _pattern_cache[glob].match(fn)
+
+
+def _load_formatters(module_name):
+    """Load a formatter (and all others in the module too)."""
+    mod = __import__(module_name, None, None, ['__all__'])
+    for formatter_name in mod.__all__:
+        cls = getattr(mod, formatter_name)
+        _formatter_cache[cls.name] = cls
+
+
+def get_all_formatters():
+    """Return a generator for all formatter classes."""
+    # NB: this returns formatter classes, not info like get_all_lexers().
+    for info in FORMATTERS.values():
+        if info[1] not in _formatter_cache:
+            _load_formatters(info[0])
+        yield _formatter_cache[info[1]]
+    for _, formatter in find_plugin_formatters():
+        yield formatter
+
+
+def find_formatter_class(alias):
+    """Lookup a formatter by alias.
+
+    Returns None if not found.
     """
-    Lex ``code`` with ``lexer`` and return an iterable of tokens.
+    for module_name, name, aliases, _, _ in FORMATTERS.values():
+        if alias in aliases:
+            if name not in _formatter_cache:
+                _load_formatters(module_name)
+            return _formatter_cache[name]
+    for _, cls in find_plugin_formatters():
+        if alias in cls.aliases:
+            return cls
+
+
+def get_formatter_by_name(_alias, **options):
+    """Lookup and instantiate a formatter by alias.
+
+    Raises ClassNotFound if not found.
+    """
+    cls = find_formatter_class(_alias)
+    if cls is None:
+        raise ClassNotFound("no formatter found for name %r" % _alias)
+    return cls(**options)
+
+
+def load_formatter_from_file(filename, formattername="CustomFormatter",
+                             **options):
+    """Load a formatter from a file.
+
+    This method expects a file located relative to the current working
+    directory, which contains a class named CustomFormatter. By default,
+    it expects the Formatter to be named CustomFormatter; you can specify
+    your own class name as the second argument to this function.
+
+    Users should be very careful with the input, because this method
+    is equivalent to running eval on the input file.
+
+    Raises ClassNotFound if there are any problems importing the Formatter.
+
+    .. versionadded:: 2.2
     """
     try:
-        return lexer.get_tokens(code)
-    except TypeError as err:
-        if (isinstance(err.args[0], str) and
-            ('unbound method get_tokens' in err.args[0] or
-             'missing 1 required positional argument' in err.args[0])):
-            raise TypeError('lex() argument must be a lexer instance, '
-                            'not a class')
+        # This empty dict will contain the namespace for the exec'd file
+        custom_namespace = {}
+        with open(filename, 'rb') as f:
+            exec(f.read(), custom_namespace)
+        # Retrieve the class `formattername` from that namespace
+        if formattername not in custom_namespace:
+            raise ClassNotFound('no valid %s class found in %s' %
+                                (formattername, filename))
+        formatter_class = custom_namespace[formattername]
+        # And finally instantiate it with the options
+        return formatter_class(**options)
+    except OSError as err:
+        raise ClassNotFound('cannot read %s: %s' % (filename, err))
+    except ClassNotFound:
         raise
+    except Exception as err:
+        raise ClassNotFound('error when loading custom formatter: %s' % err)
 
 
-def format(tokens, formatter, outfile=None):  # pylint: disable=redefined-builtin
+def get_formatter_for_filename(fn, **options):
+    """Lookup and instantiate a formatter by filename pattern.
+
+    Raises ClassNotFound if not found.
     """
-    Format a tokenlist ``tokens`` with the formatter ``formatter``.
-
-    If ``outfile`` is given and a valid file object (an object
-    with a ``write`` method), the result will be written to it, otherwise
-    it is returned as a string.
-    """
-    try:
-        if not outfile:
-            realoutfile = getattr(formatter, 'encoding', None) and BytesIO() or StringIO()
-            formatter.format(tokens, realoutfile)
-            return realoutfile.getvalue()
-        else:
-            formatter.format(tokens, outfile)
-    except TypeError as err:
-        if (isinstance(err.args[0], str) and
-            ('unbound method format' in err.args[0] or
-             'missing 1 required positional argument' in err.args[0])):
-            raise TypeError('format() argument must be a formatter instance, '
-                            'not a class')
-        raise
+    fn = basename(fn)
+    for modname, name, _, filenames, _ in FORMATTERS.values():
+        for filename in filenames:
+            if _fn_matches(fn, filename):
+                if name not in _formatter_cache:
+                    _load_formatters(modname)
+                return _formatter_cache[name](**options)
+    for cls in find_plugin_formatters():
+        for filename in cls.filenames:
+            if _fn_matches(fn, filename):
+                return cls(**options)
+    raise ClassNotFound("no formatter found for file name %r" % fn)
 
 
-def highlight(code, lexer, formatter, outfile=None):
-    """
-    Lex ``code`` with ``lexer`` and format it with the formatter ``formatter``.
+class _automodule(types.ModuleType):
+    """Automatically import formatters."""
 
-    If ``outfile`` is given and a valid file object (an object
-    with a ``write`` method), the result will be written to it, otherwise
-    it is returned as a string.
-    """
-    return format(lex(code, lexer), formatter, outfile)
+    def __getattr__(self, name):
+        info = FORMATTERS.get(name)
+        if info:
+            _load_formatters(info[0])
+            cls = _formatter_cache[info[1]]
+            setattr(self, name, cls)
+            return cls
+        raise AttributeError(name)
 
+
+oldmod = sys.modules[__name__]
+newmod = _automodule(__name__)
+newmod.__dict__.update(oldmod.__dict__)
+sys.modules[__name__] = newmod
+del newmod.newmod, newmod.oldmod, newmod.sys, newmod.types
