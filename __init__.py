@@ -1,25 +1,36 @@
-# This file is dual licensed under the terms of the Apache License, Version
-# 2.0, and the BSD License. See the LICENSE file in the root of this repository
-# for complete details.
+"""Read resources contained within a package."""
 
-from .__about__ import (
-    __author__,
-    __copyright__,
-    __email__,
-    __license__,
-    __summary__,
-    __title__,
-    __uri__,
-    __version__,
+from ._common import (
+    as_file,
+    files,
+    Package,
 )
 
+from ._legacy import (
+    contents,
+    open_binary,
+    read_binary,
+    open_text,
+    read_text,
+    is_resource,
+    path,
+    Resource,
+)
+
+from .abc import ResourceReader
+
+
 __all__ = [
-    "__title__",
-    "__summary__",
-    "__uri__",
-    "__version__",
-    "__author__",
-    "__email__",
-    "__license__",
-    "__copyright__",
+    'Package',
+    'Resource',
+    'ResourceReader',
+    'as_file',
+    'contents',
+    'files',
+    'is_resource',
+    'open_binary',
+    'open_text',
+    'path',
+    'read_binary',
+    'read_text',
 ]

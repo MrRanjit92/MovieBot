@@ -1,23 +1,35 @@
-from setuptools.extern.more_itertools import consume  # noqa: F401
+from itertools import filterfalse
+
+from typing import (
+    Callable,
+    Iterable,
+    Iterator,
+    Optional,
+    Set,
+    TypeVar,
+    Union,
+)
+
+# Type and type variable definitions
+_T = TypeVar('_T')
+_U = TypeVar('_U')
 
 
-# copied from jaraco.itertools 6.1
-def ensure_unique(iterable, key=lambda x: x):
-    """
-    Wrap an iterable to raise a ValueError if non-unique values are encountered.
-
-    >>> list(ensure_unique('abc'))
-    ['a', 'b', 'c']
-    >>> consume(ensure_unique('abca'))
-    Traceback (most recent call last):
-    ...
-    ValueError: Duplicate element 'a' encountered.
-    """
-    seen = set()
+def unique_everseen(
+    iterable: Iterable[_T], key: Optional[Callable[[_T], _U]] = None
+) -> Iterator[_T]:
+    "List unique elements, preserving order. Remember all elements ever seen."
+    # unique_everseen('AAAABBBCCDAABBB') --> A B C D
+    # unique_everseen('ABBCcAD', str.lower) --> A B C D
+    seen: Set[Union[_T, _U]] = set()
     seen_add = seen.add
-    for element in iterable:
-        k = key(element)
-        if k in seen:
-            raise ValueError(f"Duplicate element {element!r} encountered.")
-        seen_add(k)
-        yield element
+    if key is None:
+        for element in filterfalse(seen.__contains__, iterable):
+            seen_add(element)
+            yield element
+    else:
+        for element in iterable:
+            k = key(element)
+            if k not in seen:
+                seen_add(k)
+                yield element
