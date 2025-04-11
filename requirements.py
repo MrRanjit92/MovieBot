@@ -1,146 +1,166 @@
-# This file is dual licensed under the terms of the Apache License, Version
-# 2.0, and the BSD License. See the LICENSE file in the root of this repository
-# for complete details.
+from pip._vendor.packaging.specifiers import SpecifierSet
+from pip._vendor.packaging.utils import NormalizedName, canonicalize_name
 
-import re
-import string
-import urllib.parse
-from typing import List, Optional as TOptional, Set
+from pip._internal.req.req_install import InstallRequirement
 
-from pip._vendor.pyparsing import (  # noqa
-    Combine,
-    Literal as L,
-    Optional,
-    ParseException,
-    Regex,
-    Word,
-    ZeroOrMore,
-    originalTextFor,
-    stringEnd,
-    stringStart,
-)
-
-from .markers import MARKER_EXPR, Marker
-from .specifiers import LegacySpecifier, Specifier, SpecifierSet
+from .base import Candidate, CandidateLookup, Requirement, format_name
 
 
-class InvalidRequirement(ValueError):
-    """
-    An invalid requirement was found, users should refer to PEP 508.
-    """
-
-
-ALPHANUM = Word(string.ascii_letters + string.digits)
-
-LBRACKET = L("[").suppress()
-RBRACKET = L("]").suppress()
-LPAREN = L("(").suppress()
-RPAREN = L(")").suppress()
-COMMA = L(",").suppress()
-SEMICOLON = L(";").suppress()
-AT = L("@").suppress()
-
-PUNCTUATION = Word("-_.")
-IDENTIFIER_END = ALPHANUM | (ZeroOrMore(PUNCTUATION) + ALPHANUM)
-IDENTIFIER = Combine(ALPHANUM + ZeroOrMore(IDENTIFIER_END))
-
-NAME = IDENTIFIER("name")
-EXTRA = IDENTIFIER
-
-URI = Regex(r"[^ ]+")("url")
-URL = AT + URI
-
-EXTRAS_LIST = EXTRA + ZeroOrMore(COMMA + EXTRA)
-EXTRAS = (LBRACKET + Optional(EXTRAS_LIST) + RBRACKET)("extras")
-
-VERSION_PEP440 = Regex(Specifier._regex_str, re.VERBOSE | re.IGNORECASE)
-VERSION_LEGACY = Regex(LegacySpecifier._regex_str, re.VERBOSE | re.IGNORECASE)
-
-VERSION_ONE = VERSION_PEP440 ^ VERSION_LEGACY
-VERSION_MANY = Combine(
-    VERSION_ONE + ZeroOrMore(COMMA + VERSION_ONE), joinString=",", adjacent=False
-)("_raw_spec")
-_VERSION_SPEC = Optional((LPAREN + VERSION_MANY + RPAREN) | VERSION_MANY)
-_VERSION_SPEC.setParseAction(lambda s, l, t: t._raw_spec or "")
-
-VERSION_SPEC = originalTextFor(_VERSION_SPEC)("specifier")
-VERSION_SPEC.setParseAction(lambda s, l, t: t[1])
-
-MARKER_EXPR = originalTextFor(MARKER_EXPR())("marker")
-MARKER_EXPR.setParseAction(
-    lambda s, l, t: Marker(s[t._original_start : t._original_end])
-)
-MARKER_SEPARATOR = SEMICOLON
-MARKER = MARKER_SEPARATOR + MARKER_EXPR
-
-VERSION_AND_MARKER = VERSION_SPEC + Optional(MARKER)
-URL_AND_MARKER = URL + Optional(MARKER)
-
-NAMED_REQUIREMENT = NAME + Optional(EXTRAS) + (URL_AND_MARKER | VERSION_AND_MARKER)
-
-REQUIREMENT = stringStart + NAMED_REQUIREMENT + stringEnd
-# pyparsing isn't thread safe during initialization, so we do it eagerly, see
-# issue #104
-REQUIREMENT.parseString("x[]")
-
-
-class Requirement:
-    """Parse a requirement.
-
-    Parse a given requirement string into its parts, such as name, specifier,
-    URL, and extras. Raises InvalidRequirement on a badly-formed requirement
-    string.
-    """
-
-    # TODO: Can we test whether something is contained within a requirement?
-    #       If so how do we do that? Do we need to test against the _name_ of
-    #       the thing as well as the version? What about the markers?
-    # TODO: Can we normalize the name and extra name?
-
-    def __init__(self, requirement_string: str) -> None:
-        try:
-            req = REQUIREMENT.parseString(requirement_string)
-        except ParseException as e:
-            raise InvalidRequirement(
-                f'Parse error at "{ requirement_string[e.loc : e.loc + 8]!r}": {e.msg}'
-            )
-
-        self.name: str = req.name
-        if req.url:
-            parsed_url = urllib.parse.urlparse(req.url)
-            if parsed_url.scheme == "file":
-                if urllib.parse.urlunparse(parsed_url) != req.url:
-                    raise InvalidRequirement("Invalid URL given")
-            elif not (parsed_url.scheme and parsed_url.netloc) or (
-                not parsed_url.scheme and not parsed_url.netloc
-            ):
-                raise InvalidRequirement(f"Invalid URL: {req.url}")
-            self.url: TOptional[str] = req.url
-        else:
-            self.url = None
-        self.extras: Set[str] = set(req.extras.asList() if req.extras else [])
-        self.specifier: SpecifierSet = SpecifierSet(req.specifier)
-        self.marker: TOptional[Marker] = req.marker if req.marker else None
+class ExplicitRequirement(Requirement):
+    def __init__(self, candidate: Candidate) -> None:
+        self.candidate = candidate
 
     def __str__(self) -> str:
-        parts: List[str] = [self.name]
-
-        if self.extras:
-            formatted_extras = ",".join(sorted(self.extras))
-            parts.append(f"[{formatted_extras}]")
-
-        if self.specifier:
-            parts.append(str(self.specifier))
-
-        if self.url:
-            parts.append(f"@ {self.url}")
-            if self.marker:
-                parts.append(" ")
-
-        if self.marker:
-            parts.append(f"; {self.marker}")
-
-        return "".join(parts)
+        return str(self.candidate)
 
     def __repr__(self) -> str:
-        return f"<Requirement('{self}')>"
+        return "{class_name}({candidate!r})".format(
+            class_name=self.__class__.__name__,
+            candidate=self.candidate,
+        )
+
+    @property
+    def project_name(self) -> NormalizedName:
+        # No need to canonicalize - the candidate did this
+        return self.candidate.project_name
+
+    @property
+    def name(self) -> str:
+        # No need to canonicalize - the candidate did this
+        return self.candidate.name
+
+    def format_for_error(self) -> str:
+        return self.candidate.format_for_error()
+
+    def get_candidate_lookup(self) -> CandidateLookup:
+        return self.candidate, None
+
+    def is_satisfied_by(self, candidate: Candidate) -> bool:
+        return candidate == self.candidate
+
+
+class SpecifierRequirement(Requirement):
+    def __init__(self, ireq: InstallRequirement) -> None:
+        assert ireq.link is None, "This is a link, not a specifier"
+        self._ireq = ireq
+        self._extras = frozenset(ireq.extras)
+
+    def __str__(self) -> str:
+        return str(self._ireq.req)
+
+    def __repr__(self) -> str:
+        return "{class_name}({requirement!r})".format(
+            class_name=self.__class__.__name__,
+            requirement=str(self._ireq.req),
+        )
+
+    @property
+    def project_name(self) -> NormalizedName:
+        assert self._ireq.req, "Specifier-backed ireq is always PEP 508"
+        return canonicalize_name(self._ireq.req.name)
+
+    @property
+    def name(self) -> str:
+        return format_name(self.project_name, self._extras)
+
+    def format_for_error(self) -> str:
+
+        # Convert comma-separated specifiers into "A, B, ..., F and G"
+        # This makes the specifier a bit more "human readable", without
+        # risking a change in meaning. (Hopefully! Not all edge cases have
+        # been checked)
+        parts = [s.strip() for s in str(self).split(",")]
+        if len(parts) == 0:
+            return ""
+        elif len(parts) == 1:
+            return parts[0]
+
+        return ", ".join(parts[:-1]) + " and " + parts[-1]
+
+    def get_candidate_lookup(self) -> CandidateLookup:
+        return None, self._ireq
+
+    def is_satisfied_by(self, candidate: Candidate) -> bool:
+        assert candidate.name == self.name, (
+            f"Internal issue: Candidate is not for this requirement "
+            f"{candidate.name} vs {self.name}"
+        )
+        # We can safely always allow prereleases here since PackageFinder
+        # already implements the prerelease logic, and would have filtered out
+        # prerelease candidates if the user does not expect them.
+        assert self._ireq.req, "Specifier-backed ireq is always PEP 508"
+        spec = self._ireq.req.specifier
+        return spec.contains(candidate.version, prereleases=True)
+
+
+class RequiresPythonRequirement(Requirement):
+    """A requirement representing Requires-Python metadata."""
+
+    def __init__(self, specifier: SpecifierSet, match: Candidate) -> None:
+        self.specifier = specifier
+        self._candidate = match
+
+    def __str__(self) -> str:
+        return f"Python {self.specifier}"
+
+    def __repr__(self) -> str:
+        return "{class_name}({specifier!r})".format(
+            class_name=self.__class__.__name__,
+            specifier=str(self.specifier),
+        )
+
+    @property
+    def project_name(self) -> NormalizedName:
+        return self._candidate.project_name
+
+    @property
+    def name(self) -> str:
+        return self._candidate.name
+
+    def format_for_error(self) -> str:
+        return str(self)
+
+    def get_candidate_lookup(self) -> CandidateLookup:
+        if self.specifier.contains(self._candidate.version, prereleases=True):
+            return self._candidate, None
+        return None, None
+
+    def is_satisfied_by(self, candidate: Candidate) -> bool:
+        assert candidate.name == self._candidate.name, "Not Python candidate"
+        # We can safely always allow prereleases here since PackageFinder
+        # already implements the prerelease logic, and would have filtered out
+        # prerelease candidates if the user does not expect them.
+        return self.specifier.contains(candidate.version, prereleases=True)
+
+
+class UnsatisfiableRequirement(Requirement):
+    """A requirement that cannot be satisfied."""
+
+    def __init__(self, name: NormalizedName) -> None:
+        self._name = name
+
+    def __str__(self) -> str:
+        return f"{self._name} (unavailable)"
+
+    def __repr__(self) -> str:
+        return "{class_name}({name!r})".format(
+            class_name=self.__class__.__name__,
+            name=str(self._name),
+        )
+
+    @property
+    def project_name(self) -> NormalizedName:
+        return self._name
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    def format_for_error(self) -> str:
+        return str(self)
+
+    def get_candidate_lookup(self) -> CandidateLookup:
+        return None, None
+
+    def is_satisfied_by(self, candidate: Candidate) -> bool:
+        return False
