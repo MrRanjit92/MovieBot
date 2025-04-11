@@ -1,267 +1,323 @@
-# exceptions.py
+from __future__ import absolute_import
 
-import re
-import sys
-from typing import Optional
+from .packages.six.moves.http_client import IncompleteRead as httplib_IncompleteRead
 
-from .util import col, line, lineno, _collapse_string_to_ranges
-from .unicode import pyparsing_unicode as ppu
+# Base Exceptions
 
 
-class ExceptionWordUnicode(ppu.Latin1, ppu.LatinA, ppu.LatinB, ppu.Greek, ppu.Cyrillic):
+class HTTPError(Exception):
+    """Base exception used by this module."""
+
     pass
 
 
-_extract_alphanums = _collapse_string_to_ranges(ExceptionWordUnicode.alphanums)
-_exception_word_extractor = re.compile("([" + _extract_alphanums + "]{1,16})|.")
+class HTTPWarning(Warning):
+    """Base warning used by this module."""
+
+    pass
 
 
-class ParseBaseException(Exception):
-    """base exception class for all parsing runtime exceptions"""
+class PoolError(HTTPError):
+    """Base exception for errors caused within a pool."""
 
-    # Performance tuning: we construct a *lot* of these, so keep this
-    # constructor as small and fast as possible
-    def __init__(
-        self,
-        pstr: str,
-        loc: int = 0,
-        msg: Optional[str] = None,
-        elem=None,
-    ):
-        self.loc = loc
-        if msg is None:
-            self.msg = pstr
-            self.pstr = ""
-        else:
-            self.msg = msg
-            self.pstr = pstr
-        self.parser_element = self.parserElement = elem
-        self.args = (pstr, loc, msg)
+    def __init__(self, pool, message):
+        self.pool = pool
+        HTTPError.__init__(self, "%s: %s" % (pool, message))
 
-    @staticmethod
-    def explain_exception(exc, depth=16):
-        """
-        Method to take an exception and translate the Python internal traceback into a list
-        of the pyparsing expressions that caused the exception to be raised.
+    def __reduce__(self):
+        # For pickling purposes.
+        return self.__class__, (None, None)
 
-        Parameters:
 
-        - exc - exception raised during parsing (need not be a ParseException, in support
-          of Python exceptions that might be raised in a parse action)
-        - depth (default=16) - number of levels back in the stack trace to list expression
-          and function names; if None, the full stack trace names will be listed; if 0, only
-          the failing input line, marker, and exception string will be shown
+class RequestError(PoolError):
+    """Base exception for PoolErrors that have associated URLs."""
 
-        Returns a multi-line string listing the ParserElements and/or function names in the
-        exception's stack trace.
-        """
-        import inspect
-        from .core import ParserElement
+    def __init__(self, pool, url, message):
+        self.url = url
+        PoolError.__init__(self, pool, message)
 
-        if depth is None:
-            depth = sys.getrecursionlimit()
-        ret = []
-        if isinstance(exc, ParseBaseException):
-            ret.append(exc.line)
-            ret.append(" " * (exc.column - 1) + "^")
-        ret.append("{}: {}".format(type(exc).__name__, exc))
+    def __reduce__(self):
+        # For pickling purposes.
+        return self.__class__, (None, self.url, None)
 
-        if depth > 0:
-            callers = inspect.getinnerframes(exc.__traceback__, context=depth)
-            seen = set()
-            for i, ff in enumerate(callers[-depth:]):
-                frm = ff[0]
 
-                f_self = frm.f_locals.get("self", None)
-                if isinstance(f_self, ParserElement):
-                    if frm.f_code.co_name not in ("parseImpl", "_parseNoCache"):
-                        continue
-                    if id(f_self) in seen:
-                        continue
-                    seen.add(id(f_self))
+class SSLError(HTTPError):
+    """Raised when SSL certificate fails in an HTTPS connection."""
 
-                    self_type = type(f_self)
-                    ret.append(
-                        "{}.{} - {}".format(
-                            self_type.__module__, self_type.__name__, f_self
-                        )
-                    )
+    pass
 
-                elif f_self is not None:
-                    self_type = type(f_self)
-                    ret.append("{}.{}".format(self_type.__module__, self_type.__name__))
 
-                else:
-                    code = frm.f_code
-                    if code.co_name in ("wrapper", "<module>"):
-                        continue
+class ProxyError(HTTPError):
+    """Raised when the connection to a proxy fails."""
 
-                    ret.append("{}".format(code.co_name))
+    def __init__(self, message, error, *args):
+        super(ProxyError, self).__init__(message, error, *args)
+        self.original_error = error
 
-                depth -= 1
-                if not depth:
-                    break
 
-        return "\n".join(ret)
+class DecodeError(HTTPError):
+    """Raised when automatic decoding based on Content-Type fails."""
 
-    @classmethod
-    def _from_exception(cls, pe):
-        """
-        internal factory method to simplify creating one type of ParseException
-        from another - avoids having __init__ signature conflicts among subclasses
-        """
-        return cls(pe.pstr, pe.loc, pe.msg, pe.parserElement)
+    pass
 
-    @property
-    def line(self) -> str:
-        """
-        Return the line of text where the exception occurred.
-        """
-        return line(self.loc, self.pstr)
 
-    @property
-    def lineno(self) -> int:
-        """
-        Return the 1-based line number of text where the exception occurred.
-        """
-        return lineno(self.loc, self.pstr)
+class ProtocolError(HTTPError):
+    """Raised when something unexpected happens mid-request/response."""
 
-    @property
-    def col(self) -> int:
-        """
-        Return the 1-based column on the line of text where the exception occurred.
-        """
-        return col(self.loc, self.pstr)
+    pass
 
-    @property
-    def column(self) -> int:
-        """
-        Return the 1-based column on the line of text where the exception occurred.
-        """
-        return col(self.loc, self.pstr)
 
-    def __str__(self) -> str:
-        if self.pstr:
-            if self.loc >= len(self.pstr):
-                foundstr = ", found end of text"
-            else:
-                # pull out next word at error location
-                found_match = _exception_word_extractor.match(self.pstr, self.loc)
-                if found_match is not None:
-                    found = found_match.group(0)
-                else:
-                    found = self.pstr[self.loc : self.loc + 1]
-                foundstr = (", found %r" % found).replace(r"\\", "\\")
-        else:
-            foundstr = ""
-        return "{}{}  (at char {}), (line:{}, col:{})".format(
-            self.msg, foundstr, self.loc, self.lineno, self.column
-        )
+#: Renamed to ProtocolError but aliased for backwards compatibility.
+ConnectionError = ProtocolError
+
+
+# Leaf Exceptions
+
+
+class MaxRetryError(RequestError):
+    """Raised when the maximum number of retries is exceeded.
+
+    :param pool: The connection pool
+    :type pool: :class:`~urllib3.connectionpool.HTTPConnectionPool`
+    :param string url: The requested Url
+    :param exceptions.Exception reason: The underlying error
+
+    """
+
+    def __init__(self, pool, url, reason=None):
+        self.reason = reason
+
+        message = "Max retries exceeded with url: %s (Caused by %r)" % (url, reason)
+
+        RequestError.__init__(self, pool, url, message)
+
+
+class HostChangedError(RequestError):
+    """Raised when an existing pool gets a request for a foreign host."""
+
+    def __init__(self, pool, url, retries=3):
+        message = "Tried to open a foreign host with url: %s" % url
+        RequestError.__init__(self, pool, url, message)
+        self.retries = retries
+
+
+class TimeoutStateError(HTTPError):
+    """Raised when passing an invalid state to a timeout"""
+
+    pass
+
+
+class TimeoutError(HTTPError):
+    """Raised when a socket timeout error occurs.
+
+    Catching this error will catch both :exc:`ReadTimeoutErrors
+    <ReadTimeoutError>` and :exc:`ConnectTimeoutErrors <ConnectTimeoutError>`.
+    """
+
+    pass
+
+
+class ReadTimeoutError(TimeoutError, RequestError):
+    """Raised when a socket timeout occurs while receiving data from a server"""
+
+    pass
+
+
+# This timeout error does not have a URL attached and needs to inherit from the
+# base HTTPError
+class ConnectTimeoutError(TimeoutError):
+    """Raised when a socket timeout occurs while connecting to a server"""
+
+    pass
+
+
+class NewConnectionError(ConnectTimeoutError, PoolError):
+    """Raised when we fail to establish a new connection. Usually ECONNREFUSED."""
+
+    pass
+
+
+class EmptyPoolError(PoolError):
+    """Raised when a pool runs out of connections and no more are allowed."""
+
+    pass
+
+
+class ClosedPoolError(PoolError):
+    """Raised when a request enters a pool after the pool has been closed."""
+
+    pass
+
+
+class LocationValueError(ValueError, HTTPError):
+    """Raised when there is something wrong with a given URL input."""
+
+    pass
+
+
+class LocationParseError(LocationValueError):
+    """Raised when get_host or similar fails to parse the URL input."""
+
+    def __init__(self, location):
+        message = "Failed to parse: %s" % location
+        HTTPError.__init__(self, message)
+
+        self.location = location
+
+
+class URLSchemeUnknown(LocationValueError):
+    """Raised when a URL input has an unsupported scheme."""
+
+    def __init__(self, scheme):
+        message = "Not supported URL scheme %s" % scheme
+        super(URLSchemeUnknown, self).__init__(message)
+
+        self.scheme = scheme
+
+
+class ResponseError(HTTPError):
+    """Used as a container for an error reason supplied in a MaxRetryError."""
+
+    GENERIC_ERROR = "too many error responses"
+    SPECIFIC_ERROR = "too many {status_code} error responses"
+
+
+class SecurityWarning(HTTPWarning):
+    """Warned when performing security reducing actions"""
+
+    pass
+
+
+class SubjectAltNameWarning(SecurityWarning):
+    """Warned when connecting to a host with a certificate missing a SAN."""
+
+    pass
+
+
+class InsecureRequestWarning(SecurityWarning):
+    """Warned when making an unverified HTTPS request."""
+
+    pass
+
+
+class SystemTimeWarning(SecurityWarning):
+    """Warned when system time is suspected to be wrong"""
+
+    pass
+
+
+class InsecurePlatformWarning(SecurityWarning):
+    """Warned when certain TLS/SSL configuration is not available on a platform."""
+
+    pass
+
+
+class SNIMissingWarning(HTTPWarning):
+    """Warned when making a HTTPS request without SNI available."""
+
+    pass
+
+
+class DependencyWarning(HTTPWarning):
+    """
+    Warned when an attempt is made to import a module with missing optional
+    dependencies.
+    """
+
+    pass
+
+
+class ResponseNotChunked(ProtocolError, ValueError):
+    """Response needs to be chunked in order to read it as chunks."""
+
+    pass
+
+
+class BodyNotHttplibCompatible(HTTPError):
+    """
+    Body should be :class:`http.client.HTTPResponse` like
+    (have an fp attribute which returns raw chunks) for read_chunked().
+    """
+
+    pass
+
+
+class IncompleteRead(HTTPError, httplib_IncompleteRead):
+    """
+    Response length doesn't match expected Content-Length
+
+    Subclass of :class:`http.client.IncompleteRead` to allow int value
+    for ``partial`` to avoid creating large objects on streamed reads.
+    """
+
+    def __init__(self, partial, expected):
+        super(IncompleteRead, self).__init__(partial, expected)
 
     def __repr__(self):
-        return str(self)
+        return "IncompleteRead(%i bytes read, %i more expected)" % (
+            self.partial,
+            self.expected,
+        )
 
-    def mark_input_line(self, marker_string: str = None, *, markerString=">!<") -> str:
-        """
-        Extracts the exception line from the input string, and marks
-        the location of the exception with a special symbol.
-        """
-        markerString = marker_string if marker_string is not None else markerString
-        line_str = self.line
-        line_column = self.column - 1
-        if markerString:
-            line_str = "".join(
-                (line_str[:line_column], markerString, line_str[line_column:])
+
+class InvalidChunkLength(HTTPError, httplib_IncompleteRead):
+    """Invalid chunk length in a chunked response."""
+
+    def __init__(self, response, length):
+        super(InvalidChunkLength, self).__init__(
+            response.tell(), response.length_remaining
+        )
+        self.response = response
+        self.length = length
+
+    def __repr__(self):
+        return "InvalidChunkLength(got length %r, %i bytes read)" % (
+            self.length,
+            self.partial,
+        )
+
+
+class InvalidHeader(HTTPError):
+    """The header provided was somehow invalid."""
+
+    pass
+
+
+class ProxySchemeUnknown(AssertionError, URLSchemeUnknown):
+    """ProxyManager does not support the supplied scheme"""
+
+    # TODO(t-8ch): Stop inheriting from AssertionError in v2.0.
+
+    def __init__(self, scheme):
+        # 'localhost' is here because our URL parser parses
+        # localhost:8080 -> scheme=localhost, remove if we fix this.
+        if scheme == "localhost":
+            scheme = None
+        if scheme is None:
+            message = "Proxy URL had no scheme, should start with http:// or https://"
+        else:
+            message = (
+                "Proxy URL had unsupported scheme %s, should use http:// or https://"
+                % scheme
             )
-        return line_str.strip()
-
-    def explain(self, depth=16) -> str:
-        """
-        Method to translate the Python internal traceback into a list
-        of the pyparsing expressions that caused the exception to be raised.
-
-        Parameters:
-
-        - depth (default=16) - number of levels back in the stack trace to list expression
-          and function names; if None, the full stack trace names will be listed; if 0, only
-          the failing input line, marker, and exception string will be shown
-
-        Returns a multi-line string listing the ParserElements and/or function names in the
-        exception's stack trace.
-
-        Example::
-
-            expr = pp.Word(pp.nums) * 3
-            try:
-                expr.parse_string("123 456 A789")
-            except pp.ParseException as pe:
-                print(pe.explain(depth=0))
-
-        prints::
-
-            123 456 A789
-                    ^
-            ParseException: Expected W:(0-9), found 'A'  (at char 8), (line:1, col:9)
-
-        Note: the diagnostic output will include string representations of the expressions
-        that failed to parse. These representations will be more helpful if you use `set_name` to
-        give identifiable names to your expressions. Otherwise they will use the default string
-        forms, which may be cryptic to read.
-
-        Note: pyparsing's default truncation of exception tracebacks may also truncate the
-        stack of expressions that are displayed in the ``explain`` output. To get the full listing
-        of parser expressions, you may have to set ``ParserElement.verbose_stacktrace = True``
-        """
-        return self.explain_exception(self, depth)
-
-    markInputline = mark_input_line
+        super(ProxySchemeUnknown, self).__init__(message)
 
 
-class ParseException(ParseBaseException):
-    """
-    Exception thrown when a parse expression doesn't match the input string
+class ProxySchemeUnsupported(ValueError):
+    """Fetching HTTPS resources through HTTPS proxies is unsupported"""
 
-    Example::
-
-        try:
-            Word(nums).set_name("integer").parse_string("ABC")
-        except ParseException as pe:
-            print(pe)
-            print("column: {}".format(pe.column))
-
-    prints::
-
-       Expected integer (at char 0), (line:1, col:1)
-        column: 1
-
-    """
+    pass
 
 
-class ParseFatalException(ParseBaseException):
-    """
-    User-throwable exception thrown when inconsistent parse content
-    is found; stops all parsing immediately
-    """
+class HeaderParsingError(HTTPError):
+    """Raised by assert_header_parsing, but we convert it to a log.warning statement."""
+
+    def __init__(self, defects, unparsed_data):
+        message = "%s, unparsed data: %r" % (defects or "Unknown", unparsed_data)
+        super(HeaderParsingError, self).__init__(message)
 
 
-class ParseSyntaxException(ParseFatalException):
-    """
-    Just like :class:`ParseFatalException`, but thrown internally
-    when an :class:`ErrorStop<And._ErrorStop>` ('-' operator) indicates
-    that parsing is to stop immediately because an unbacktrackable
-    syntax error has been found.
-    """
+class UnrewindableBodyError(HTTPError):
+    """urllib3 encountered an error when trying to rewind a body"""
 
-
-class RecursiveGrammarException(Exception):
-    """
-    Exception thrown by :class:`ParserElement.validate` if the
-    grammar could be left-recursive; parser may need to enable
-    left recursion using :class:`ParserElement.enable_left_recursion<ParserElement.enable_left_recursion>`
-    """
-
-    def __init__(self, parseElementList):
-        self.parseElementTrace = parseElementList
-
-    def __str__(self) -> str:
-        return "RecursiveGrammarException: {}".format(self.parseElementTrace)
+    pass
