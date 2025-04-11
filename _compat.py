@@ -1,98 +1,43 @@
-# flake8: noqa
-
-import abc
-import sys
-import pathlib
-from contextlib import suppress
-
-if sys.version_info >= (3, 10):
-    from zipfile import Path as ZipPath  # type: ignore
-else:
-    from ..zipp import Path as ZipPath  # type: ignore
+import importlib.metadata
+from typing import Any, Optional, Protocol, cast
 
 
-try:
-    from typing import runtime_checkable  # type: ignore
-except ImportError:
+class BasePath(Protocol):
+    """A protocol that various path objects conform.
 
-    def runtime_checkable(cls):  # type: ignore
-        return cls
+    This exists because importlib.metadata uses both ``pathlib.Path`` and
+    ``zipfile.Path``, and we need a common base for type hints (Union does not
+    work well since ``zipfile.Path`` is too new for our linter setup).
 
-
-try:
-    from typing import Protocol  # type: ignore
-except ImportError:
-    Protocol = abc.ABC  # type: ignore
-
-
-class TraversableResourcesLoader:
+    This does not mean to be exhaustive, but only contains things that present
+    in both classes *that we need*.
     """
-    Adapt loaders to provide TraversableResources and other
-    compatibility.
-
-    Used primarily for Python 3.9 and earlier where the native
-    loaders do not yet implement TraversableResources.
-    """
-
-    def __init__(self, spec):
-        self.spec = spec
 
     @property
-    def path(self):
-        return self.spec.origin
+    def name(self) -> str:
+        raise NotImplementedError()
 
-    def get_resource_reader(self, name):
-        from . import readers, _adapters
-
-        def _zip_reader(spec):
-            with suppress(AttributeError):
-                return readers.ZipReader(spec.loader, spec.name)
-
-        def _namespace_reader(spec):
-            with suppress(AttributeError, ValueError):
-                return readers.NamespaceReader(spec.submodule_search_locations)
-
-        def _available_reader(spec):
-            with suppress(AttributeError):
-                return spec.loader.get_resource_reader(spec.name)
-
-        def _native_reader(spec):
-            reader = _available_reader(spec)
-            return reader if hasattr(reader, 'files') else None
-
-        def _file_reader(spec):
-            try:
-                path = pathlib.Path(self.path)
-            except TypeError:
-                return None
-            if path.exists():
-                return readers.FileReader(self)
-
-        return (
-            # native reader if it supplies 'files'
-            _native_reader(self.spec)
-            or
-            # local ZipReader if a zip module
-            _zip_reader(self.spec)
-            or
-            # local NamespaceReader if a namespace module
-            _namespace_reader(self.spec)
-            or
-            # local FileReader
-            _file_reader(self.spec)
-            # fallback - adapt the spec ResourceReader to TraversableReader
-            or _adapters.CompatibilityFiles(self.spec)
-        )
+    @property
+    def parent(self) -> "BasePath":
+        raise NotImplementedError()
 
 
-def wrap_spec(package):
+def get_info_location(d: importlib.metadata.Distribution) -> Optional[BasePath]:
+    """Find the path to the distribution's metadata directory.
+
+    HACK: This relies on importlib.metadata's private ``_path`` attribute. Not
+    all distributions exist on disk, so importlib.metadata is correct to not
+    expose the attribute as public. But pip's code base is old and not as clean,
+    so we do this to avoid having to rewrite too many things. Hopefully we can
+    eliminate this some day.
     """
-    Construct a package spec with traversable compatibility
-    on the spec/loader/reader.
+    return getattr(d, "_path", None)
 
-    Supersedes _adapters.wrap_spec to use TraversableResourcesLoader
-    from above for older Python compatibility (<3.10).
+
+def get_dist_name(dist: importlib.metadata.Distribution) -> str:
+    """Get the distribution's project name.
+
+    The ``name`` attribute is only available in Python 3.10 or later. We are
+    targeting exactly that, but Mypy does not know this.
     """
-    from . import _adapters
-
-    return _adapters.SpecLoaderAdapter(package.__spec__, TraversableResourcesLoader)
+    return cast(Any, dist).name
