@@ -7,7 +7,7 @@ import string
 import urllib.parse
 from typing import List, Optional as TOptional, Set
 
-from setuptools.extern.pyparsing import (  # noqa
+from pkg_resources.extern.pyparsing import (  # noqa
     Combine,
     Literal as L,
     Optional,
@@ -79,7 +79,7 @@ URL_AND_MARKER = URL + Optional(MARKER)
 NAMED_REQUIREMENT = NAME + Optional(EXTRAS) + (URL_AND_MARKER | VERSION_AND_MARKER)
 
 REQUIREMENT = stringStart + NAMED_REQUIREMENT + stringEnd
-# setuptools.extern.pyparsing isn't thread safe during initialization, so we do it eagerly, see
+# pkg_resources.extern.pyparsing isn't thread safe during initialization, so we do it eagerly, see
 # issue #104
 REQUIREMENT.parseString("x[]")
 

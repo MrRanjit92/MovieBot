@@ -1,611 +1,599 @@
-import railroad
-import pyparsing
-from pkg_resources import resource_filename
-from typing import (
-    List,
-    Optional,
-    NamedTuple,
-    Generic,
-    TypeVar,
-    Dict,
-    Callable,
-    Set,
-    Iterable,
-)
-from jinja2 import Template
-from io import StringIO
-import inspect
+import re
+import itertools
+import textwrap
+import functools
+
+try:
+    from importlib.resources import files  # type: ignore
+except ImportError:  # pragma: nocover
+    from pkg_resources.extern.importlib_resources import files  # type: ignore
+
+from pkg_resources.extern.jaraco.functools import compose, method_cache
+from pkg_resources.extern.jaraco.context import ExceptionTrap
 
 
-with open(resource_filename(__name__, "template.jinja2"), encoding="utf-8") as fp:
-    template = Template(fp.read())
-
-# Note: ideally this would be a dataclass, but we're supporting Python 3.5+ so we can't do this yet
-NamedDiagram = NamedTuple(
-    "NamedDiagram",
-    [("name", str), ("diagram", Optional[railroad.DiagramItem]), ("index", int)],
-)
-"""
-A simple structure for associating a name with a railroad diagram
-"""
-
-T = TypeVar("T")
-
-
-class EachItem(railroad.Group):
+def substitution(old, new):
     """
-    Custom railroad item to compose a:
-    - Group containing a
-      - OneOrMore containing a
-        - Choice of the elements in the Each
-    with the group label indicating that all must be matched
+    Return a function that will perform a substitution on a string
+    """
+    return lambda s: s.replace(old, new)
+
+
+def multi_substitution(*substitutions):
+    """
+    Take a sequence of pairs specifying substitutions, and create
+    a function that performs those substitutions.
+
+    >>> multi_substitution(('foo', 'bar'), ('bar', 'baz'))('foo')
+    'baz'
+    """
+    substitutions = itertools.starmap(substitution, substitutions)
+    # compose function applies last function first, so reverse the
+    #  substitutions to get the expected order.
+    substitutions = reversed(tuple(substitutions))
+    return compose(*substitutions)
+
+
+class FoldedCase(str):
+    """
+    A case insensitive string class; behaves just like str
+    except compares equal when the only variation is case.
+
+    >>> s = FoldedCase('hello world')
+
+    >>> s == 'Hello World'
+    True
+
+    >>> 'Hello World' == s
+    True
+
+    >>> s != 'Hello World'
+    False
+
+    >>> s.index('O')
+    4
+
+    >>> s.split('O')
+    ['hell', ' w', 'rld']
+
+    >>> sorted(map(FoldedCase, ['GAMMA', 'alpha', 'Beta']))
+    ['alpha', 'Beta', 'GAMMA']
+
+    Sequence membership is straightforward.
+
+    >>> "Hello World" in [s]
+    True
+    >>> s in ["Hello World"]
+    True
+
+    You may test for set inclusion, but candidate and elements
+    must both be folded.
+
+    >>> FoldedCase("Hello World") in {s}
+    True
+    >>> s in {FoldedCase("Hello World")}
+    True
+
+    String inclusion works as long as the FoldedCase object
+    is on the right.
+
+    >>> "hello" in FoldedCase("Hello World")
+    True
+
+    But not if the FoldedCase object is on the left:
+
+    >>> FoldedCase('hello') in 'Hello World'
+    False
+
+    In that case, use ``in_``:
+
+    >>> FoldedCase('hello').in_('Hello World')
+    True
+
+    >>> FoldedCase('hello') > FoldedCase('Hello')
+    False
     """
 
-    all_label = "[ALL]"
+    def __lt__(self, other):
+        return self.lower() < other.lower()
 
-    def __init__(self, *items):
-        choice_item = railroad.Choice(len(items) - 1, *items)
-        one_or_more_item = railroad.OneOrMore(item=choice_item)
-        super().__init__(one_or_more_item, label=self.all_label)
+    def __gt__(self, other):
+        return self.lower() > other.lower()
+
+    def __eq__(self, other):
+        return self.lower() == other.lower()
+
+    def __ne__(self, other):
+        return self.lower() != other.lower()
+
+    def __hash__(self):
+        return hash(self.lower())
+
+    def __contains__(self, other):
+        return super().lower().__contains__(other.lower())
+
+    def in_(self, other):
+        "Does self appear in other?"
+        return self in FoldedCase(other)
+
+    # cache lower since it's likely to be called frequently.
+    @method_cache
+    def lower(self):
+        return super().lower()
+
+    def index(self, sub):
+        return self.lower().index(sub.lower())
+
+    def split(self, splitter=' ', maxsplit=0):
+        pattern = re.compile(re.escape(splitter), re.I)
+        return pattern.split(self, maxsplit)
 
 
-class AnnotatedItem(railroad.Group):
+# Python 3.8 compatibility
+_unicode_trap = ExceptionTrap(UnicodeDecodeError)
+
+
+@_unicode_trap.passes
+def is_decodable(value):
+    r"""
+    Return True if the supplied value is decodable (using the default
+    encoding).
+
+    >>> is_decodable(b'\xff')
+    False
+    >>> is_decodable(b'\x32')
+    True
     """
-    Simple subclass of Group that creates an annotation label
+    value.decode()
+
+
+def is_binary(value):
+    r"""
+    Return True if the value appears to be binary (that is, it's a byte
+    string and isn't decodable).
+
+    >>> is_binary(b'\xff')
+    True
+    >>> is_binary('\xff')
+    False
+    """
+    return isinstance(value, bytes) and not is_decodable(value)
+
+
+def trim(s):
+    r"""
+    Trim something like a docstring to remove the whitespace that
+    is common due to indentation and formatting.
+
+    >>> trim("\n\tfoo = bar\n\t\tbar = baz\n")
+    'foo = bar\n\tbar = baz'
+    """
+    return textwrap.dedent(s).strip()
+
+
+def wrap(s):
+    """
+    Wrap lines of text, retaining existing newlines as
+    paragraph markers.
+
+    >>> print(wrap(lorem_ipsum))
+    Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do
+    eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad
+    minim veniam, quis nostrud exercitation ullamco laboris nisi ut
+    aliquip ex ea commodo consequat. Duis aute irure dolor in
+    reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla
+    pariatur. Excepteur sint occaecat cupidatat non proident, sunt in
+    culpa qui officia deserunt mollit anim id est laborum.
+    <BLANKLINE>
+    Curabitur pretium tincidunt lacus. Nulla gravida orci a odio. Nullam
+    varius, turpis et commodo pharetra, est eros bibendum elit, nec luctus
+    magna felis sollicitudin mauris. Integer in mauris eu nibh euismod
+    gravida. Duis ac tellus et risus vulputate vehicula. Donec lobortis
+    risus a elit. Etiam tempor. Ut ullamcorper, ligula eu tempor congue,
+    eros est euismod turpis, id tincidunt sapien risus a quam. Maecenas
+    fermentum consequat mi. Donec fermentum. Pellentesque malesuada nulla
+    a mi. Duis sapien sem, aliquet nec, commodo eget, consequat quis,
+    neque. Aliquam faucibus, elit ut dictum aliquet, felis nisl adipiscing
+    sapien, sed malesuada diam lacus eget erat. Cras mollis scelerisque
+    nunc. Nullam arcu. Aliquam consequat. Curabitur augue lorem, dapibus
+    quis, laoreet et, pretium ac, nisi. Aenean magna nisl, mollis quis,
+    molestie eu, feugiat in, orci. In hac habitasse platea dictumst.
+    """
+    paragraphs = s.splitlines()
+    wrapped = ('\n'.join(textwrap.wrap(para)) for para in paragraphs)
+    return '\n\n'.join(wrapped)
+
+
+def unwrap(s):
+    r"""
+    Given a multi-line string, return an unwrapped version.
+
+    >>> wrapped = wrap(lorem_ipsum)
+    >>> wrapped.count('\n')
+    20
+    >>> unwrapped = unwrap(wrapped)
+    >>> unwrapped.count('\n')
+    1
+    >>> print(unwrapped)
+    Lorem ipsum dolor sit amet, consectetur adipiscing ...
+    Curabitur pretium tincidunt lacus. Nulla gravida orci ...
+
+    """
+    paragraphs = re.split(r'\n\n+', s)
+    cleaned = (para.replace('\n', ' ') for para in paragraphs)
+    return '\n'.join(cleaned)
+
+
+
+
+class Splitter(object):
+    """object that will split a string with the given arguments for each call
+
+    >>> s = Splitter(',')
+    >>> s('hello, world, this is your, master calling')
+    ['hello', ' world', ' this is your', ' master calling']
     """
 
-    def __init__(self, label: str, item):
-        super().__init__(item=item, label="[{}]".format(label) if label else label)
-
-
-class EditablePartial(Generic[T]):
-    """
-    Acts like a functools.partial, but can be edited. In other words, it represents a type that hasn't yet been
-    constructed.
-    """
-
-    # We need this here because the railroad constructors actually transform the data, so can't be called until the
-    # entire tree is assembled
-
-    def __init__(self, func: Callable[..., T], args: list, kwargs: dict):
-        self.func = func
+    def __init__(self, *args):
         self.args = args
-        self.kwargs = kwargs
+
+    def __call__(self, s):
+        return s.split(*self.args)
+
+
+def indent(string, prefix=' ' * 4):
+    """
+    >>> indent('foo')
+    '    foo'
+    """
+    return prefix + string
+
+
+class WordSet(tuple):
+    """
+    Given an identifier, return the words that identifier represents,
+    whether in camel case, underscore-separated, etc.
+
+    >>> WordSet.parse("camelCase")
+    ('camel', 'Case')
+
+    >>> WordSet.parse("under_sep")
+    ('under', 'sep')
+
+    Acronyms should be retained
+
+    >>> WordSet.parse("firstSNL")
+    ('first', 'SNL')
+
+    >>> WordSet.parse("you_and_I")
+    ('you', 'and', 'I')
+
+    >>> WordSet.parse("A simple test")
+    ('A', 'simple', 'test')
+
+    Multiple caps should not interfere with the first cap of another word.
+
+    >>> WordSet.parse("myABCClass")
+    ('my', 'ABC', 'Class')
+
+    The result is a WordSet, so you can get the form you need.
+
+    >>> WordSet.parse("myABCClass").underscore_separated()
+    'my_ABC_Class'
+
+    >>> WordSet.parse('a-command').camel_case()
+    'ACommand'
+
+    >>> WordSet.parse('someIdentifier').lowered().space_separated()
+    'some identifier'
+
+    Slices of the result should return another WordSet.
+
+    >>> WordSet.parse('taken-out-of-context')[1:].underscore_separated()
+    'out_of_context'
+
+    >>> WordSet.from_class_name(WordSet()).lowered().space_separated()
+    'word set'
+
+    >>> example = WordSet.parse('figured it out')
+    >>> example.headless_camel_case()
+    'figuredItOut'
+    >>> example.dash_separated()
+    'figured-it-out'
+
+    """
+
+    _pattern = re.compile('([A-Z]?[a-z]+)|([A-Z]+(?![a-z]))')
+
+    def capitalized(self):
+        return WordSet(word.capitalize() for word in self)
+
+    def lowered(self):
+        return WordSet(word.lower() for word in self)
+
+    def camel_case(self):
+        return ''.join(self.capitalized())
+
+    def headless_camel_case(self):
+        words = iter(self)
+        first = next(words).lower()
+        new_words = itertools.chain((first,), WordSet(words).camel_case())
+        return ''.join(new_words)
+
+    def underscore_separated(self):
+        return '_'.join(self)
+
+    def dash_separated(self):
+        return '-'.join(self)
+
+    def space_separated(self):
+        return ' '.join(self)
+
+    def trim_right(self, item):
+        """
+        Remove the item from the end of the set.
+
+        >>> WordSet.parse('foo bar').trim_right('foo')
+        ('foo', 'bar')
+        >>> WordSet.parse('foo bar').trim_right('bar')
+        ('foo',)
+        >>> WordSet.parse('').trim_right('bar')
+        ()
+        """
+        return self[:-1] if self and self[-1] == item else self
+
+    def trim_left(self, item):
+        """
+        Remove the item from the beginning of the set.
+
+        >>> WordSet.parse('foo bar').trim_left('foo')
+        ('bar',)
+        >>> WordSet.parse('foo bar').trim_left('bar')
+        ('foo', 'bar')
+        >>> WordSet.parse('').trim_left('bar')
+        ()
+        """
+        return self[1:] if self and self[0] == item else self
+
+    def trim(self, item):
+        """
+        >>> WordSet.parse('foo bar').trim('foo')
+        ('bar',)
+        """
+        return self.trim_left(item).trim_right(item)
+
+    def __getitem__(self, item):
+        result = super(WordSet, self).__getitem__(item)
+        if isinstance(item, slice):
+            result = WordSet(result)
+        return result
 
     @classmethod
-    def from_call(cls, func: Callable[..., T], *args, **kwargs) -> "EditablePartial[T]":
+    def parse(cls, identifier):
+        matches = cls._pattern.finditer(identifier)
+        return WordSet(match.group(0) for match in matches)
+
+    @classmethod
+    def from_class_name(cls, subject):
+        return cls.parse(subject.__class__.__name__)
+
+
+# for backward compatibility
+words = WordSet.parse
+
+
+def simple_html_strip(s):
+    r"""
+    Remove HTML from the string `s`.
+
+    >>> str(simple_html_strip(''))
+    ''
+
+    >>> print(simple_html_strip('A <bold>stormy</bold> day in paradise'))
+    A stormy day in paradise
+
+    >>> print(simple_html_strip('Somebody <!-- do not --> tell the truth.'))
+    Somebody  tell the truth.
+
+    >>> print(simple_html_strip('What about<br/>\nmultiple lines?'))
+    What about
+    multiple lines?
+    """
+    html_stripper = re.compile('(<!--.*?-->)|(<[^>]*>)|([^<]+)', re.DOTALL)
+    texts = (match.group(3) or '' for match in html_stripper.finditer(s))
+    return ''.join(texts)
+
+
+class SeparatedValues(str):
+    """
+    A string separated by a separator. Overrides __iter__ for getting
+    the values.
+
+    >>> list(SeparatedValues('a,b,c'))
+    ['a', 'b', 'c']
+
+    Whitespace is stripped and empty values are discarded.
+
+    >>> list(SeparatedValues(' a,   b   , c,  '))
+    ['a', 'b', 'c']
+    """
+
+    separator = ','
+
+    def __iter__(self):
+        parts = self.split(self.separator)
+        return filter(None, (part.strip() for part in parts))
+
+
+class Stripper:
+    r"""
+    Given a series of lines, find the common prefix and strip it from them.
+
+    >>> lines = [
+    ...     'abcdefg\n',
+    ...     'abc\n',
+    ...     'abcde\n',
+    ... ]
+    >>> res = Stripper.strip_prefix(lines)
+    >>> res.prefix
+    'abc'
+    >>> list(res.lines)
+    ['defg\n', '\n', 'de\n']
+
+    If no prefix is common, nothing should be stripped.
+
+    >>> lines = [
+    ...     'abcd\n',
+    ...     '1234\n',
+    ... ]
+    >>> res = Stripper.strip_prefix(lines)
+    >>> res.prefix = ''
+    >>> list(res.lines)
+    ['abcd\n', '1234\n']
+    """
+
+    def __init__(self, prefix, lines):
+        self.prefix = prefix
+        self.lines = map(self, lines)
+
+    @classmethod
+    def strip_prefix(cls, lines):
+        prefix_lines, lines = itertools.tee(lines)
+        prefix = functools.reduce(cls.common_prefix, prefix_lines)
+        return cls(prefix, lines)
+
+    def __call__(self, line):
+        if not self.prefix:
+            return line
+        null, prefix, rest = line.partition(self.prefix)
+        return rest
+
+    @staticmethod
+    def common_prefix(s1, s2):
         """
-        If you call this function in the same way that you would call the constructor, it will store the arguments
-        as you expect. For example EditablePartial.from_call(Fraction, 1, 3)() == Fraction(1, 3)
+        Return the common prefix of two lines.
         """
-        return EditablePartial(func=func, args=list(args), kwargs=kwargs)
-
-    @property
-    def name(self):
-        return self.kwargs["name"]
-
-    def __call__(self) -> T:
-        """
-        Evaluate the partial and return the result
-        """
-        args = self.args.copy()
-        kwargs = self.kwargs.copy()
-
-        # This is a helpful hack to allow you to specify varargs parameters (e.g. *args) as keyword args (e.g.
-        # args=['list', 'of', 'things'])
-        arg_spec = inspect.getfullargspec(self.func)
-        if arg_spec.varargs in self.kwargs:
-            args += kwargs.pop(arg_spec.varargs)
-
-        return self.func(*args, **kwargs)
+        index = min(len(s1), len(s2))
+        while s1[:index] != s2[:index]:
+            index -= 1
+        return s1[:index]
 
 
-def railroad_to_html(diagrams: List[NamedDiagram], **kwargs) -> str:
+def remove_prefix(text, prefix):
     """
-    Given a list of NamedDiagram, produce a single HTML string that visualises those diagrams
-    :params kwargs: kwargs to be passed in to the template
+    Remove the prefix from the text if it exists.
+
+    >>> remove_prefix('underwhelming performance', 'underwhelming ')
+    'performance'
+
+    >>> remove_prefix('something special', 'sample')
+    'something special'
     """
-    data = []
-    for diagram in diagrams:
-        io = StringIO()
-        diagram.diagram.writeSvg(io.write)
-        title = diagram.name
-        if diagram.index == 0:
-            title += " (root)"
-        data.append({"title": title, "text": "", "svg": io.getvalue()})
-
-    return template.render(diagrams=data, **kwargs)
+    null, prefix, rest = text.rpartition(prefix)
+    return rest
 
 
-def resolve_partial(partial: "EditablePartial[T]") -> T:
+def remove_suffix(text, suffix):
     """
-    Recursively resolves a collection of Partials into whatever type they are
+    Remove the suffix from the text if it exists.
+
+    >>> remove_suffix('name.git', '.git')
+    'name'
+
+    >>> remove_suffix('something special', 'sample')
+    'something special'
     """
-    if isinstance(partial, EditablePartial):
-        partial.args = resolve_partial(partial.args)
-        partial.kwargs = resolve_partial(partial.kwargs)
-        return partial()
-    elif isinstance(partial, list):
-        return [resolve_partial(x) for x in partial]
-    elif isinstance(partial, dict):
-        return {key: resolve_partial(x) for key, x in partial.items()}
-    else:
-        return partial
+    rest, suffix, null = text.partition(suffix)
+    return rest
 
 
-def to_railroad(
-    element: pyparsing.ParserElement,
-    diagram_kwargs: Optional[dict] = None,
-    vertical: int = 3,
-    show_results_names: bool = False,
-    show_groups: bool = False,
-) -> List[NamedDiagram]:
+def normalize_newlines(text):
+    r"""
+    Replace alternate newlines with the canonical newline.
+
+    >>> normalize_newlines('Lorem Ipsum\u2029')
+    'Lorem Ipsum\n'
+    >>> normalize_newlines('Lorem Ipsum\r\n')
+    'Lorem Ipsum\n'
+    >>> normalize_newlines('Lorem Ipsum\x85')
+    'Lorem Ipsum\n'
     """
-    Convert a pyparsing element tree into a list of diagrams. This is the recommended entrypoint to diagram
-    creation if you want to access the Railroad tree before it is converted to HTML
-    :param element: base element of the parser being diagrammed
-    :param diagram_kwargs: kwargs to pass to the Diagram() constructor
-    :param vertical: (optional) - int - limit at which number of alternatives should be
-       shown vertically instead of horizontally
-    :param show_results_names - bool to indicate whether results name annotations should be
-       included in the diagram
-    :param show_groups - bool to indicate whether groups should be highlighted with an unlabeled
-       surrounding box
+    newlines = ['\r\n', '\r', '\n', '\u0085', '\u2028', '\u2029']
+    pattern = '|'.join(newlines)
+    return re.sub(pattern, '\n', text)
+
+
+def _nonblank(str):
+    return str and not str.startswith('#')
+
+
+@functools.singledispatch
+def yield_lines(iterable):
+    r"""
+    Yield valid lines of a string or iterable.
+
+    >>> list(yield_lines(''))
+    []
+    >>> list(yield_lines(['foo', 'bar']))
+    ['foo', 'bar']
+    >>> list(yield_lines('foo\nbar'))
+    ['foo', 'bar']
+    >>> list(yield_lines('\nfoo\n#bar\nbaz #comment'))
+    ['foo', 'baz #comment']
+    >>> list(yield_lines(['foo\nbar', 'baz', 'bing\n\n\n']))
+    ['foo', 'bar', 'baz', 'bing']
     """
-    # Convert the whole tree underneath the root
-    lookup = ConverterState(diagram_kwargs=diagram_kwargs or {})
-    _to_diagram_element(
-        element,
-        lookup=lookup,
-        parent=None,
-        vertical=vertical,
-        show_results_names=show_results_names,
-        show_groups=show_groups,
-    )
-
-    root_id = id(element)
-    # Convert the root if it hasn't been already
-    if root_id in lookup:
-        if not element.customName:
-            lookup[root_id].name = ""
-        lookup[root_id].mark_for_extraction(root_id, lookup, force=True)
-
-    # Now that we're finished, we can convert from intermediate structures into Railroad elements
-    diags = list(lookup.diagrams.values())
-    if len(diags) > 1:
-        # collapse out duplicate diags with the same name
-        seen = set()
-        deduped_diags = []
-        for d in diags:
-            # don't extract SkipTo elements, they are uninformative as subdiagrams
-            if d.name == "...":
-                continue
-            if d.name is not None and d.name not in seen:
-                seen.add(d.name)
-                deduped_diags.append(d)
-        resolved = [resolve_partial(partial) for partial in deduped_diags]
-    else:
-        # special case - if just one diagram, always display it, even if
-        # it has no name
-        resolved = [resolve_partial(partial) for partial in diags]
-    return sorted(resolved, key=lambda diag: diag.index)
+    return itertools.chain.from_iterable(map(yield_lines, iterable))
 
 
-def _should_vertical(
-    specification: int, exprs: Iterable[pyparsing.ParserElement]
-) -> bool:
+@yield_lines.register(str)
+def _(text):
+    return filter(_nonblank, map(str.strip, text.splitlines()))
+
+
+def drop_comment(line):
     """
-    Returns true if we should return a vertical list of elements
+    Drop comments.
+
+    >>> drop_comment('foo # bar')
+    'foo'
+
+    A hash without a space may be in a URL.
+
+    >>> drop_comment('http://example.com/foo#bar')
+    'http://example.com/foo#bar'
     """
-    if specification is None:
-        return False
-    else:
-        return len(_visible_exprs(exprs)) >= specification
+    return line.partition(' #')[0]
 
 
-class ElementState:
+def join_continuation(lines):
+    r"""
+    Join lines continued by a trailing backslash.
+
+    >>> list(join_continuation(['foo \\', 'bar', 'baz']))
+    ['foobar', 'baz']
+    >>> list(join_continuation(['foo \\', 'bar', 'baz']))
+    ['foobar', 'baz']
+    >>> list(join_continuation(['foo \\', 'bar \\', 'baz']))
+    ['foobarbaz']
+
+    Not sure why, but...
+    The character preceeding the backslash is also elided.
+
+    >>> list(join_continuation(['goo\\', 'dly']))
+    ['godly']
+
+    A terrible idea, but...
+    If no line is available to continue, suppress the lines.
+
+    >>> list(join_continuation(['foo', 'bar\\', 'baz\\']))
+    ['foo']
     """
-    State recorded for an individual pyparsing Element
-    """
-
-    # Note: this should be a dataclass, but we have to support Python 3.5
-    def __init__(
-        self,
-        element: pyparsing.ParserElement,
-        converted: EditablePartial,
-        parent: EditablePartial,
-        number: int,
-        name: str = None,
-        parent_index: Optional[int] = None,
-    ):
-        #: The pyparsing element that this represents
-        self.element: pyparsing.ParserElement = element
-        #: The name of the element
-        self.name: str = name
-        #: The output Railroad element in an unconverted state
-        self.converted: EditablePartial = converted
-        #: The parent Railroad element, which we store so that we can extract this if it's duplicated
-        self.parent: EditablePartial = parent
-        #: The order in which we found this element, used for sorting diagrams if this is extracted into a diagram
-        self.number: int = number
-        #: The index of this inside its parent
-        self.parent_index: Optional[int] = parent_index
-        #: If true, we should extract this out into a subdiagram
-        self.extract: bool = False
-        #: If true, all of this element's children have been filled out
-        self.complete: bool = False
-
-    def mark_for_extraction(
-        self, el_id: int, state: "ConverterState", name: str = None, force: bool = False
-    ):
-        """
-        Called when this instance has been seen twice, and thus should eventually be extracted into a sub-diagram
-        :param el_id: id of the element
-        :param state: element/diagram state tracker
-        :param name: name to use for this element's text
-        :param force: If true, force extraction now, regardless of the state of this. Only useful for extracting the
-        root element when we know we're finished
-        """
-        self.extract = True
-
-        # Set the name
-        if not self.name:
-            if name:
-                # Allow forcing a custom name
-                self.name = name
-            elif self.element.customName:
-                self.name = self.element.customName
-            else:
-                self.name = ""
-
-        # Just because this is marked for extraction doesn't mean we can do it yet. We may have to wait for children
-        # to be added
-        # Also, if this is just a string literal etc, don't bother extracting it
-        if force or (self.complete and _worth_extracting(self.element)):
-            state.extract_into_diagram(el_id)
-
-
-class ConverterState:
-    """
-    Stores some state that persists between recursions into the element tree
-    """
-
-    def __init__(self, diagram_kwargs: Optional[dict] = None):
-        #: A dictionary mapping ParserElements to state relating to them
-        self._element_diagram_states: Dict[int, ElementState] = {}
-        #: A dictionary mapping ParserElement IDs to subdiagrams generated from them
-        self.diagrams: Dict[int, EditablePartial[NamedDiagram]] = {}
-        #: The index of the next unnamed element
-        self.unnamed_index: int = 1
-        #: The index of the next element. This is used for sorting
-        self.index: int = 0
-        #: Shared kwargs that are used to customize the construction of diagrams
-        self.diagram_kwargs: dict = diagram_kwargs or {}
-        self.extracted_diagram_names: Set[str] = set()
-
-    def __setitem__(self, key: int, value: ElementState):
-        self._element_diagram_states[key] = value
-
-    def __getitem__(self, key: int) -> ElementState:
-        return self._element_diagram_states[key]
-
-    def __delitem__(self, key: int):
-        del self._element_diagram_states[key]
-
-    def __contains__(self, key: int):
-        return key in self._element_diagram_states
-
-    def generate_unnamed(self) -> int:
-        """
-        Generate a number used in the name of an otherwise unnamed diagram
-        """
-        self.unnamed_index += 1
-        return self.unnamed_index
-
-    def generate_index(self) -> int:
-        """
-        Generate a number used to index a diagram
-        """
-        self.index += 1
-        return self.index
-
-    def extract_into_diagram(self, el_id: int):
-        """
-        Used when we encounter the same token twice in the same tree. When this
-        happens, we replace all instances of that token with a terminal, and
-        create a new subdiagram for the token
-        """
-        position = self[el_id]
-
-        # Replace the original definition of this element with a regular block
-        if position.parent:
-            ret = EditablePartial.from_call(railroad.NonTerminal, text=position.name)
-            if "item" in position.parent.kwargs:
-                position.parent.kwargs["item"] = ret
-            elif "items" in position.parent.kwargs:
-                position.parent.kwargs["items"][position.parent_index] = ret
-
-        # If the element we're extracting is a group, skip to its content but keep the title
-        if position.converted.func == railroad.Group:
-            content = position.converted.kwargs["item"]
-        else:
-            content = position.converted
-
-        self.diagrams[el_id] = EditablePartial.from_call(
-            NamedDiagram,
-            name=position.name,
-            diagram=EditablePartial.from_call(
-                railroad.Diagram, content, **self.diagram_kwargs
-            ),
-            index=position.number,
-        )
-
-        del self[el_id]
-
-
-def _worth_extracting(element: pyparsing.ParserElement) -> bool:
-    """
-    Returns true if this element is worth having its own sub-diagram. Simply, if any of its children
-    themselves have children, then its complex enough to extract
-    """
-    children = element.recurse()
-    return any(child.recurse() for child in children)
-
-
-def _apply_diagram_item_enhancements(fn):
-    """
-    decorator to ensure enhancements to a diagram item (such as results name annotations)
-    get applied on return from _to_diagram_element (we do this since there are several
-    returns in _to_diagram_element)
-    """
-
-    def _inner(
-        element: pyparsing.ParserElement,
-        parent: Optional[EditablePartial],
-        lookup: ConverterState = None,
-        vertical: int = None,
-        index: int = 0,
-        name_hint: str = None,
-        show_results_names: bool = False,
-        show_groups: bool = False,
-    ) -> Optional[EditablePartial]:
-
-        ret = fn(
-            element,
-            parent,
-            lookup,
-            vertical,
-            index,
-            name_hint,
-            show_results_names,
-            show_groups,
-        )
-
-        # apply annotation for results name, if present
-        if show_results_names and ret is not None:
-            element_results_name = element.resultsName
-            if element_results_name:
-                # add "*" to indicate if this is a "list all results" name
-                element_results_name += "" if element.modalResults else "*"
-                ret = EditablePartial.from_call(
-                    railroad.Group, item=ret, label=element_results_name
-                )
-
-        return ret
-
-    return _inner
-
-
-def _visible_exprs(exprs: Iterable[pyparsing.ParserElement]):
-    non_diagramming_exprs = (
-        pyparsing.ParseElementEnhance,
-        pyparsing.PositionToken,
-        pyparsing.And._ErrorStop,
-    )
-    return [
-        e
-        for e in exprs
-        if not (e.customName or e.resultsName or isinstance(e, non_diagramming_exprs))
-    ]
-
-
-@_apply_diagram_item_enhancements
-def _to_diagram_element(
-    element: pyparsing.ParserElement,
-    parent: Optional[EditablePartial],
-    lookup: ConverterState = None,
-    vertical: int = None,
-    index: int = 0,
-    name_hint: str = None,
-    show_results_names: bool = False,
-    show_groups: bool = False,
-) -> Optional[EditablePartial]:
-    """
-    Recursively converts a PyParsing Element to a railroad Element
-    :param lookup: The shared converter state that keeps track of useful things
-    :param index: The index of this element within the parent
-    :param parent: The parent of this element in the output tree
-    :param vertical: Controls at what point we make a list of elements vertical. If this is an integer (the default),
-    it sets the threshold of the number of items before we go vertical. If True, always go vertical, if False, never
-    do so
-    :param name_hint: If provided, this will override the generated name
-    :param show_results_names: bool flag indicating whether to add annotations for results names
-    :returns: The converted version of the input element, but as a Partial that hasn't yet been constructed
-    :param show_groups: bool flag indicating whether to show groups using bounding box
-    """
-    exprs = element.recurse()
-    name = name_hint or element.customName or element.__class__.__name__
-
-    # Python's id() is used to provide a unique identifier for elements
-    el_id = id(element)
-
-    element_results_name = element.resultsName
-
-    # Here we basically bypass processing certain wrapper elements if they contribute nothing to the diagram
-    if not element.customName:
-        if isinstance(
-            element,
-            (
-                # pyparsing.TokenConverter,
-                # pyparsing.Forward,
-                pyparsing.Located,
-            ),
-        ):
-            # However, if this element has a useful custom name, and its child does not, we can pass it on to the child
-            if exprs:
-                if not exprs[0].customName:
-                    propagated_name = name
-                else:
-                    propagated_name = None
-
-                return _to_diagram_element(
-                    element.expr,
-                    parent=parent,
-                    lookup=lookup,
-                    vertical=vertical,
-                    index=index,
-                    name_hint=propagated_name,
-                    show_results_names=show_results_names,
-                    show_groups=show_groups,
-                )
-
-    # If the element isn't worth extracting, we always treat it as the first time we say it
-    if _worth_extracting(element):
-        if el_id in lookup:
-            # If we've seen this element exactly once before, we are only just now finding out that it's a duplicate,
-            # so we have to extract it into a new diagram.
-            looked_up = lookup[el_id]
-            looked_up.mark_for_extraction(el_id, lookup, name=name_hint)
-            ret = EditablePartial.from_call(railroad.NonTerminal, text=looked_up.name)
-            return ret
-
-        elif el_id in lookup.diagrams:
-            # If we have seen the element at least twice before, and have already extracted it into a subdiagram, we
-            # just put in a marker element that refers to the sub-diagram
-            ret = EditablePartial.from_call(
-                railroad.NonTerminal, text=lookup.diagrams[el_id].kwargs["name"]
-            )
-            return ret
-
-    # Recursively convert child elements
-    # Here we find the most relevant Railroad element for matching pyparsing Element
-    # We use ``items=[]`` here to hold the place for where the child elements will go once created
-    if isinstance(element, pyparsing.And):
-        # detect And's created with ``expr*N`` notation - for these use a OneOrMore with a repeat
-        # (all will have the same name, and resultsName)
-        if not exprs:
-            return None
-        if len(set((e.name, e.resultsName) for e in exprs)) == 1:
-            ret = EditablePartial.from_call(
-                railroad.OneOrMore, item="", repeat=str(len(exprs))
-            )
-        elif _should_vertical(vertical, exprs):
-            ret = EditablePartial.from_call(railroad.Stack, items=[])
-        else:
-            ret = EditablePartial.from_call(railroad.Sequence, items=[])
-    elif isinstance(element, (pyparsing.Or, pyparsing.MatchFirst)):
-        if not exprs:
-            return None
-        if _should_vertical(vertical, exprs):
-            ret = EditablePartial.from_call(railroad.Choice, 0, items=[])
-        else:
-            ret = EditablePartial.from_call(railroad.HorizontalChoice, items=[])
-    elif isinstance(element, pyparsing.Each):
-        if not exprs:
-            return None
-        ret = EditablePartial.from_call(EachItem, items=[])
-    elif isinstance(element, pyparsing.NotAny):
-        ret = EditablePartial.from_call(AnnotatedItem, label="NOT", item="")
-    elif isinstance(element, pyparsing.FollowedBy):
-        ret = EditablePartial.from_call(AnnotatedItem, label="LOOKAHEAD", item="")
-    elif isinstance(element, pyparsing.PrecededBy):
-        ret = EditablePartial.from_call(AnnotatedItem, label="LOOKBEHIND", item="")
-    elif isinstance(element, pyparsing.Group):
-        if show_groups:
-            ret = EditablePartial.from_call(AnnotatedItem, label="", item="")
-        else:
-            ret = EditablePartial.from_call(railroad.Group, label="", item="")
-    elif isinstance(element, pyparsing.TokenConverter):
-        ret = EditablePartial.from_call(AnnotatedItem, label=type(element).__name__.lower(), item="")
-    elif isinstance(element, pyparsing.Opt):
-        ret = EditablePartial.from_call(railroad.Optional, item="")
-    elif isinstance(element, pyparsing.OneOrMore):
-        ret = EditablePartial.from_call(railroad.OneOrMore, item="")
-    elif isinstance(element, pyparsing.ZeroOrMore):
-        ret = EditablePartial.from_call(railroad.ZeroOrMore, item="")
-    elif isinstance(element, pyparsing.Group):
-        ret = EditablePartial.from_call(
-            railroad.Group, item=None, label=element_results_name
-        )
-    elif isinstance(element, pyparsing.Empty) and not element.customName:
-        # Skip unnamed "Empty" elements
-        ret = None
-    elif len(exprs) > 1:
-        ret = EditablePartial.from_call(railroad.Sequence, items=[])
-    elif len(exprs) > 0 and not element_results_name:
-        ret = EditablePartial.from_call(railroad.Group, item="", label=name)
-    else:
-        terminal = EditablePartial.from_call(railroad.Terminal, element.defaultName)
-        ret = terminal
-
-    if ret is None:
-        return
-
-    # Indicate this element's position in the tree so we can extract it if necessary
-    lookup[el_id] = ElementState(
-        element=element,
-        converted=ret,
-        parent=parent,
-        parent_index=index,
-        number=lookup.generate_index(),
-    )
-    if element.customName:
-        lookup[el_id].mark_for_extraction(el_id, lookup, element.customName)
-
-    i = 0
-    for expr in exprs:
-        # Add a placeholder index in case we have to extract the child before we even add it to the parent
-        if "items" in ret.kwargs:
-            ret.kwargs["items"].insert(i, None)
-
-        item = _to_diagram_element(
-            expr,
-            parent=ret,
-            lookup=lookup,
-            vertical=vertical,
-            index=i,
-            show_results_names=show_results_names,
-            show_groups=show_groups,
-        )
-
-        # Some elements don't need to be shown in the diagram
-        if item is not None:
-            if "item" in ret.kwargs:
-                ret.kwargs["item"] = item
-            elif "items" in ret.kwargs:
-                # If we've already extracted the child, don't touch this index, since it's occupied by a nonterminal
-                ret.kwargs["items"][i] = item
-                i += 1
-        elif "items" in ret.kwargs:
-            # If we're supposed to skip this element, remove it from the parent
-            del ret.kwargs["items"][i]
-
-    # If all this items children are none, skip this item
-    if ret and (
-        ("items" in ret.kwargs and len(ret.kwargs["items"]) == 0)
-        or ("item" in ret.kwargs and ret.kwargs["item"] is None)
-    ):
-        ret = EditablePartial.from_call(railroad.Terminal, name)
-
-    # Mark this element as "complete", ie it has all of its children
-    if el_id in lookup:
-        lookup[el_id].complete = True
-
-    if el_id in lookup and lookup[el_id].extract and lookup[el_id].complete:
-        lookup.extract_into_diagram(el_id)
-        if ret is not None:
-            ret = EditablePartial.from_call(
-                railroad.NonTerminal, text=lookup.diagrams[el_id].kwargs["name"]
-            )
-
-    return ret
+    lines = iter(lines)
+    for item in lines:
+        while item.endswith('\\'):
+            try:
+                item = item[:-2].strip() + next(lines)
+            except StopIteration:
+                return
+        yield item

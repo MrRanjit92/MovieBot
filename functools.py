@@ -5,7 +5,7 @@ import collections
 import types
 import itertools
 
-import setuptools.extern.more_itertools
+import pkg_resources.extern.more_itertools
 
 from typing import Callable, TypeVar
 
