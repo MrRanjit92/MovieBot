@@ -1,44 +1,6 @@
-from .package_data import __version__
-from .core import (
-    IDNABidiError,
-    IDNAError,
-    InvalidCodepoint,
-    InvalidCodepointContext,
-    alabel,
-    check_bidi,
-    check_hyphen_ok,
-    check_initial_combiner,
-    check_label,
-    check_nfc,
-    decode,
-    encode,
-    ulabel,
-    uts46_remap,
-    valid_contextj,
-    valid_contexto,
-    valid_label_length,
-    valid_string_length,
-)
-from .intranges import intranges_contain
+# Copyright Jonathan Hartley 2013. BSD 3-Clause license, see LICENSE file.
+from .initialise import init, deinit, reinit, colorama_text
+from .ansi import Fore, Back, Style, Cursor
+from .ansitowin32 import AnsiToWin32
 
-__all__ = [
-    "IDNABidiError",
-    "IDNAError",
-    "InvalidCodepoint",
-    "InvalidCodepointContext",
-    "alabel",
-    "check_bidi",
-    "check_hyphen_ok",
-    "check_initial_combiner",
-    "check_label",
-    "check_nfc",
-    "decode",
-    "encode",
-    "intranges_contain",
-    "ulabel",
-    "uts46_remap",
-    "valid_contextj",
-    "valid_contexto",
-    "valid_label_length",
-    "valid_string_length",
-]
+__version__ = '0.4.5'
