@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>MovieBot | Chat</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css">
+    <style>
+        body {
+            background: linear-gradient(to right, #ffd89b, #85f2ff);
+            font-family: 'Segoe UI', sans-serif;
+        }
+        .chat-container {
+            max-width: 700px;
+            margin: 30px auto;
+            background: #f8f9fa;
+            border-radius: 12px;
+            padding: 20px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+        }
+        .header {
+            background-color: #6f42c1;
+            color: white;
+            padding: 15px;
+            border-radius: 12px 12px 0 0;
+            text-align: center;
+            font-weight: bold;
+        }
+        .messages {
+            height: 400px;
+            overflow-y: auto;
+            padding: 15px;
+            background: #fefefe;
+        }
+        .bubble {
+            padding: 12px 18px;
+            border-radius: 20px;
+            margin-bottom: 12px;
+            max-width: 75%;
+            word-wrap: break-word;
+            display: inline-block;
+            position: relative;
+        }
+        .bubble.user {
+            background-color: #007bff;
+            color: white;
+            margin-left: auto;
+            text-align: right;
+        }
+        .bubble.bot {
+            background-color: #e9ecef;
+            color: #333;
+            margin-right: auto;
+        }
+        .genre-tag {
+            font-size: 0.9em;
+            font-weight: bold;
+            color: #6c757d;
+        }
+        .rating-star {
+            color: gold;
+            font-size: 1.1em;
+        }
+        .chat-input {
+            display: flex;
+            gap: 10px;
+            margin-top: 15px;
+        }
+        .chat-input input {
+            flex: 1;
+        }
+        #suggestion-buttons .suggestion {
+  margin: 6px;
+  padding: 8px 14px;
+  background: #eee;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: all 0.2s;
+  font-size: 14px;
+}
+
+#suggestion-buttons .suggestion:hover {
+  background-color: #d1d1ff;
+  transform: scale(1.05);
+}
+
+    </style>
+</head>
+<body>
+
+<nav class="navbar navbar-expand-lg navbar-dark" style="background-color: #6f42c1;">
+    <div class="container-fluid">
+        <a class="navbar-brand" href="/">🎬 MovieBot</a>
+        <div class="d-flex">
+            <a href="/admin-dashboard" class="btn btn-outline-light me-2">Admin</a>
+            <button class="btn btn-danger" onclick="logout()">Logout</button>
+        </div>
+    </div>
+</nav>
+
+<div class="chat-container">
+    <div class="header">Ask for recommendations by mood, genre, or movie name!</div>
+    <div class="messages" id="messages">
+        <!-- Dynamic messages -->
+    </div>
+    <div id="suggestion-buttons" style="text-align:center; margin-top: 10px;">
+      <button class="suggestion" onclick="fillAndSend('Funny movies 😂')">😂 Comedy</button>
+      <button class="suggestion" onclick="fillAndSend('I want something like Inception')">🌀 Inception</button>
+      <button class="suggestion" onclick="fillAndSend('Recent horror films')">👻 Horror</button>
+      <button class="suggestion" onclick="fillAndSend('Action movies with Tom Cruise')">💥 Action</button>
+    </div>
+    
+
+    <div class="chat-input">
+        <input type="text" id="userInput" class="form-control" placeholder="What do you feel like watching?...">
+        <button class="btn btn-primary" onclick="sendMessage()">Send</button>
+    </div>
+</div>
+
+<script>
+  if (!localStorage.getItem("token")) {
+      window.location.href = "/";
+    }
+    // Starter chatbot prompts
+window.addEventListener("DOMContentLoaded", () => {
+  appendMessage("bot", `
+    👋 <strong>Welcome to MovieBot!</strong><br>
+    I'm here to recommend movies based on your mood, genre, or favorites.<br><br>
+    💡 Try asking:
+    <ul>
+      <li>Funny movies</li>
+      <li>Like Inception</li>
+      <li>Recent horror films</li>
+      <li>Action with Tom Cruise</li>
+    </ul>
+  `);
+});
+
+
+    function logout() {
+      localStorage.removeItem("token");
+      localStorage.removeItem("userId");
+      localStorage.removeItem("userRole");
+      window.location.href = "/";
+    }
+  function toggleContrast() {
+    document.body.classList.toggle("contrast");
+  }
+
+  function appendMessage(sender, htmlContent) {
+    const container = document.getElementById("messages");
+    const wrap = document.createElement("div");
+    wrap.className = sender;
+
+    const bubble = document.createElement("div");
+    bubble.className = "bubble";
+    bubble.innerHTML = htmlContent;
+
+    wrap.appendChild(bubble);
+    container.appendChild(wrap);
+    container.scrollTop = container.scrollHeight;
+  }
+
+  async function sendMessage() {
+    const input = document.getElementById("userInput");
+    const text = input.value.trim();
+    if (!text) return;
+    appendMessage("user", `<strong>You:</strong> ${text}`);
+    input.value = "";
+
+    const res = await fetch("/recommend", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-access-token": localStorage.getItem("token")
+      },
+      body: JSON.stringify({ prompt: text })
+    });
+
+    const data = await res.json();
+    if (!data.recommendations || data.recommendations.length === 0) {
+      appendMessage("bot", "😕 No good matches found.");
+      return;
+    }
+
+    let replyHTML = "<div><strong>🎥 Recommendations:</strong></div><br>";
+    for (const r of data.recommendations) {
+      replyHTML += `
+        <div class="d-flex mb-3" style="gap: 10px;">
+          ${r.poster_url ? `<img src="${r.poster_url}" alt="${r.title} poster" style="width: 80px; border-radius: 8px;">` : ''}
+          <div>
+            <div><strong>${r.title}</strong></div>
+            <div>🎭 <em>${r.genres}</em></div>
+            <div>⭐ Rating: <strong>${r.predicted_rating}</strong></div>
+            <div style="font-size: 0.9em; margin-top: 5px;">${r.overview || "No description found."}</div>
+          </div>
+        </div>
+        <hr>
+      `;
+    }
+
+    appendMessage("bot", replyHTML);
+  }
+  function fillAndSend(text) {
+  document.getElementById("userInput").value = text;
+  sendMessage(); // trigger submit
+}
+
+</script>
+
+
+</body>
+</html>

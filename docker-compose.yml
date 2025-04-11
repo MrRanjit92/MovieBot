@@ -1,0 +1,22 @@
+
+services:
+  mongo:
+    image: mongo
+    container_name: moviebot-mongo
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+
+  flask:
+    build: .
+    container_name: moviebot-flask
+    ports:
+      - "5000:5000"
+    environment:
+      - FLASK_ENV=development
+    depends_on:
+      - mongo
+
+volumes:
+  mongo_data:
