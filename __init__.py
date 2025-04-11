@@ -1,36 +1,24 @@
-"""Read resources contained within a package."""
+"""distutils
 
-from ._common import (
-    as_file,
-    files,
-    Package,
-)
+The main package for the Python Module Distribution Utilities.  Normally
+used from a setup script as
 
-from ._legacy import (
-    contents,
-    open_binary,
-    read_binary,
-    open_text,
-    read_text,
-    is_resource,
-    path,
-    Resource,
-)
+   from distutils.core import setup
 
-from .abc import ResourceReader
+   setup (...)
+"""
+
+import sys
+import importlib
+
+__version__ = sys.version[: sys.version.index(' ')]
 
 
-__all__ = [
-    'Package',
-    'Resource',
-    'ResourceReader',
-    'as_file',
-    'contents',
-    'files',
-    'is_resource',
-    'open_binary',
-    'open_text',
-    'path',
-    'read_binary',
-    'read_text',
-]
+try:
+    # Allow Debian and pkgsrc (only) to customize system
+    # behavior. Ref pypa/distutils#2 and pypa/distutils#16.
+    # This hook is deprecated and no other environments
+    # should use it.
+    importlib.import_module('_distutils_system_mod')
+except ImportError:
+    pass

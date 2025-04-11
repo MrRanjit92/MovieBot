@@ -1,98 +1,71 @@
-# flake8: noqa
-
-import abc
 import sys
-import pathlib
-from contextlib import suppress
+import platform
 
-if sys.version_info >= (3, 10):
-    from zipfile import Path as ZipPath  # type: ignore
-else:
-    from ..zipp import Path as ZipPath  # type: ignore
+
+__all__ = ['install', 'NullFinder', 'Protocol']
 
 
 try:
-    from typing import runtime_checkable  # type: ignore
-except ImportError:
-
-    def runtime_checkable(cls):  # type: ignore
-        return cls
+    from typing import Protocol
+except ImportError:  # pragma: no cover
+    from ..typing_extensions import Protocol  # type: ignore
 
 
-try:
-    from typing import Protocol  # type: ignore
-except ImportError:
-    Protocol = abc.ABC  # type: ignore
-
-
-class TraversableResourcesLoader:
+def install(cls):
     """
-    Adapt loaders to provide TraversableResources and other
-    compatibility.
+    Class decorator for installation on sys.meta_path.
 
-    Used primarily for Python 3.9 and earlier where the native
-    loaders do not yet implement TraversableResources.
+    Adds the backport DistributionFinder to sys.meta_path and
+    attempts to disable the finder functionality of the stdlib
+    DistributionFinder.
+    """
+    sys.meta_path.append(cls())
+    disable_stdlib_finder()
+    return cls
+
+
+def disable_stdlib_finder():
+    """
+    Give the backport primacy for discovering path-based distributions
+    by monkey-patching the stdlib O_O.
+
+    See #91 for more background for rationale on this sketchy
+    behavior.
     """
 
-    def __init__(self, spec):
-        self.spec = spec
+    def matches(finder):
+        return getattr(
+            finder, '__module__', None
+        ) == '_frozen_importlib_external' and hasattr(finder, 'find_distributions')
 
-    @property
-    def path(self):
-        return self.spec.origin
-
-    def get_resource_reader(self, name):
-        from . import readers, _adapters
-
-        def _zip_reader(spec):
-            with suppress(AttributeError):
-                return readers.ZipReader(spec.loader, spec.name)
-
-        def _namespace_reader(spec):
-            with suppress(AttributeError, ValueError):
-                return readers.NamespaceReader(spec.submodule_search_locations)
-
-        def _available_reader(spec):
-            with suppress(AttributeError):
-                return spec.loader.get_resource_reader(spec.name)
-
-        def _native_reader(spec):
-            reader = _available_reader(spec)
-            return reader if hasattr(reader, 'files') else None
-
-        def _file_reader(spec):
-            try:
-                path = pathlib.Path(self.path)
-            except TypeError:
-                return None
-            if path.exists():
-                return readers.FileReader(self)
-
-        return (
-            # native reader if it supplies 'files'
-            _native_reader(self.spec)
-            or
-            # local ZipReader if a zip module
-            _zip_reader(self.spec)
-            or
-            # local NamespaceReader if a namespace module
-            _namespace_reader(self.spec)
-            or
-            # local FileReader
-            _file_reader(self.spec)
-            # fallback - adapt the spec ResourceReader to TraversableReader
-            or _adapters.CompatibilityFiles(self.spec)
-        )
+    for finder in filter(matches, sys.meta_path):  # pragma: nocover
+        del finder.find_distributions
 
 
-def wrap_spec(package):
+class NullFinder:
     """
-    Construct a package spec with traversable compatibility
-    on the spec/loader/reader.
-
-    Supersedes _adapters.wrap_spec to use TraversableResourcesLoader
-    from above for older Python compatibility (<3.10).
+    A "Finder" (aka "MetaClassFinder") that never finds any modules,
+    but may find distributions.
     """
-    from . import _adapters
 
-    return _adapters.SpecLoaderAdapter(package.__spec__, TraversableResourcesLoader)
+    @staticmethod
+    def find_spec(*args, **kwargs):
+        return None
+
+    # In Python 2, the import system requires finders
+    # to have a find_module() method, but this usage
+    # is deprecated in Python 3 in favor of find_spec().
+    # For the purposes of this finder (i.e. being present
+    # on sys.meta_path but having no other import
+    # system functionality), the two methods are identical.
+    find_module = find_spec
+
+
+def pypy_partial(val):
+    """
+    Adjust for variable stacklevel on partial under PyPy.
+
+    Workaround for #327.
+    """
+    is_pypy = platform.python_implementation() == 'PyPy'
+    return val + is_pypy
