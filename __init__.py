@@ -1,182 +1,83 @@
-#   __
-#  /__)  _  _     _   _ _/   _
-# / (   (- (/ (/ (- _)  /  _)
-#          /
-
 """
-Requests HTTP Library
-~~~~~~~~~~~~~~~~~~~~~
+    Pygments
+    ~~~~~~~~
 
-Requests is an HTTP library, written in Python, for human beings.
-Basic GET usage:
+    Pygments is a syntax highlighting package written in Python.
 
-   >>> import requests
-   >>> r = requests.get('https://www.python.org')
-   >>> r.status_code
-   200
-   >>> b'Python is a programming language' in r.content
-   True
+    It is a generic syntax highlighter for general use in all kinds of software
+    such as forum systems, wikis or other applications that need to prettify
+    source code. Highlights are:
 
-... or POST:
+    * a wide range of common languages and markup formats is supported
+    * special attention is paid to details, increasing quality by a fair amount
+    * support for new languages and formats are added easily
+    * a number of output formats, presently HTML, LaTeX, RTF, SVG, all image
+      formats that PIL supports, and ANSI sequences
+    * it is usable as a command-line tool and as a library
+    * ... and it highlights even Brainfuck!
 
-   >>> payload = dict(key1='value1', key2='value2')
-   >>> r = requests.post('https://httpbin.org/post', data=payload)
-   >>> print(r.text)
-   {
-     ...
-     "form": {
-       "key1": "value1",
-       "key2": "value2"
-     },
-     ...
-   }
+    The `Pygments master branch`_ is installable with ``easy_install Pygments==dev``.
 
-The other HTTP methods are supported - see `requests.api`. Full documentation
-is at <https://requests.readthedocs.io>.
+    .. _Pygments master branch:
+       https://github.com/pygments/pygments/archive/master.zip#egg=Pygments-dev
 
-:copyright: (c) 2017 by Kenneth Reitz.
-:license: Apache 2.0, see LICENSE for more details.
+    :copyright: Copyright 2006-2022 by the Pygments team, see AUTHORS.
+    :license: BSD, see LICENSE for details.
 """
+from io import StringIO, BytesIO
 
-import warnings
+__version__ = '2.12.0'
+__docformat__ = 'restructuredtext'
 
-from pip._vendor import urllib3
-
-from .exceptions import RequestsDependencyWarning
-
-charset_normalizer_version = None
-
-try:
-    from pip._vendor.chardet import __version__ as chardet_version
-except ImportError:
-    chardet_version = None
+__all__ = ['lex', 'format', 'highlight']
 
 
-def check_compatibility(urllib3_version, chardet_version, charset_normalizer_version):
-    urllib3_version = urllib3_version.split(".")
-    assert urllib3_version != ["dev"]  # Verify urllib3 isn't installed from git.
-
-    # Sometimes, urllib3 only reports its version as 16.1.
-    if len(urllib3_version) == 2:
-        urllib3_version.append("0")
-
-    # Check urllib3 for compatibility.
-    major, minor, patch = urllib3_version  # noqa: F811
-    major, minor, patch = int(major), int(minor), int(patch)
-    # urllib3 >= 1.21.1, <= 1.26
-    assert major == 1
-    assert minor >= 21
-    assert minor <= 26
-
-    # Check charset_normalizer for compatibility.
-    if chardet_version:
-        major, minor, patch = chardet_version.split(".")[:3]
-        major, minor, patch = int(major), int(minor), int(patch)
-        # chardet_version >= 3.0.2, < 6.0.0
-        assert (3, 0, 2) <= (major, minor, patch) < (6, 0, 0)
-    elif charset_normalizer_version:
-        major, minor, patch = charset_normalizer_version.split(".")[:3]
-        major, minor, patch = int(major), int(minor), int(patch)
-        # charset_normalizer >= 2.0.0 < 3.0.0
-        assert (2, 0, 0) <= (major, minor, patch) < (3, 0, 0)
-    else:
-        raise Exception("You need either charset_normalizer or chardet installed")
-
-
-def _check_cryptography(cryptography_version):
-    # cryptography < 1.3.4
+def lex(code, lexer):
+    """
+    Lex ``code`` with ``lexer`` and return an iterable of tokens.
+    """
     try:
-        cryptography_version = list(map(int, cryptography_version.split(".")))
-    except ValueError:
-        return
+        return lexer.get_tokens(code)
+    except TypeError as err:
+        if (isinstance(err.args[0], str) and
+            ('unbound method get_tokens' in err.args[0] or
+             'missing 1 required positional argument' in err.args[0])):
+            raise TypeError('lex() argument must be a lexer instance, '
+                            'not a class')
+        raise
 
-    if cryptography_version < [1, 3, 4]:
-        warning = "Old version of cryptography ({}) may cause slowdown.".format(
-            cryptography_version
-        )
-        warnings.warn(warning, RequestsDependencyWarning)
 
+def format(tokens, formatter, outfile=None):  # pylint: disable=redefined-builtin
+    """
+    Format a tokenlist ``tokens`` with the formatter ``formatter``.
 
-# Check imported dependencies for compatibility.
-try:
-    check_compatibility(
-        urllib3.__version__, chardet_version, charset_normalizer_version
-    )
-except (AssertionError, ValueError):
-    warnings.warn(
-        "urllib3 ({}) or chardet ({})/charset_normalizer ({}) doesn't match a supported "
-        "version!".format(
-            urllib3.__version__, chardet_version, charset_normalizer_version
-        ),
-        RequestsDependencyWarning,
-    )
-
-# Attempt to enable urllib3's fallback for SNI support
-# if the standard library doesn't support SNI or the
-# 'ssl' library isn't available.
-try:
-    # Note: This logic prevents upgrading cryptography on Windows, if imported
-    #       as part of pip.
-    from pip._internal.utils.compat import WINDOWS
-    if not WINDOWS:
-        raise ImportError("pip internals: don't import cryptography on Windows")
+    If ``outfile`` is given and a valid file object (an object
+    with a ``write`` method), the result will be written to it, otherwise
+    it is returned as a string.
+    """
     try:
-        import ssl
-    except ImportError:
-        ssl = None
+        if not outfile:
+            realoutfile = getattr(formatter, 'encoding', None) and BytesIO() or StringIO()
+            formatter.format(tokens, realoutfile)
+            return realoutfile.getvalue()
+        else:
+            formatter.format(tokens, outfile)
+    except TypeError as err:
+        if (isinstance(err.args[0], str) and
+            ('unbound method format' in err.args[0] or
+             'missing 1 required positional argument' in err.args[0])):
+            raise TypeError('format() argument must be a formatter instance, '
+                            'not a class')
+        raise
 
-    if not getattr(ssl, "HAS_SNI", False):
-        from pip._vendor.urllib3.contrib import pyopenssl
 
-        pyopenssl.inject_into_urllib3()
+def highlight(code, lexer, formatter, outfile=None):
+    """
+    Lex ``code`` with ``lexer`` and format it with the formatter ``formatter``.
 
-        # Check cryptography version
-        from cryptography import __version__ as cryptography_version
+    If ``outfile`` is given and a valid file object (an object
+    with a ``write`` method), the result will be written to it, otherwise
+    it is returned as a string.
+    """
+    return format(lex(code, lexer), formatter, outfile)
 
-        _check_cryptography(cryptography_version)
-except ImportError:
-    pass
-
-# urllib3's DependencyWarnings should be silenced.
-from pip._vendor.urllib3.exceptions import DependencyWarning
-
-warnings.simplefilter("ignore", DependencyWarning)
-
-# Set default logging handler to avoid "No handler found" warnings.
-import logging
-from logging import NullHandler
-
-from . import packages, utils
-from .__version__ import (
-    __author__,
-    __author_email__,
-    __build__,
-    __cake__,
-    __copyright__,
-    __description__,
-    __license__,
-    __title__,
-    __url__,
-    __version__,
-)
-from .api import delete, get, head, options, patch, post, put, request
-from .exceptions import (
-    ConnectionError,
-    ConnectTimeout,
-    FileModeWarning,
-    HTTPError,
-    JSONDecodeError,
-    ReadTimeout,
-    RequestException,
-    Timeout,
-    TooManyRedirects,
-    URLRequired,
-)
-from .models import PreparedRequest, Request, Response
-from .sessions import Session, session
-from .status_codes import codes
-
-logging.getLogger(__name__).addHandler(NullHandler())
-
-# FileModeWarnings go off per the default.
-warnings.simplefilter("default", FileModeWarning, append=True)
